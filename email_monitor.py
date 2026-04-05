@@ -29,10 +29,10 @@ def _get_db_key(cat: CheshireCat) -> str:
     return f"plugins:{_get_job_id(cat)}:seen"
 
 
-def _save_seen_uids(cat: CheshireCat, seen: Dict[str, Any]) -> None:
+async def _save_seen_uids(cat: CheshireCat, seen: Dict[str, Any]) -> None:
     """Persist already-processed UIDs to disk."""
     try:
-        crud_settings.store(_get_db_key(cat), seen)
+        await crud_settings.store(_get_db_key(cat), seen)
     except Exception as e:
         log.error(f"[EmailMonitor] Error saving seen UIDs: {e}")
 
@@ -188,19 +188,27 @@ def _fetch_new_emails(
 # Core monitoring function (called by the scheduler)
 # ---------------------------------------------------------------------------
 
-def _check_mailbox(settings: EmailMonitorSettings, cat: CheshireCat) -> None:
+async def _check_mailbox(settings: EmailMonitorSettings, cat: CheshireCat) -> None:
     """
     Connect to the IMAP server, fetch new emails from inbox and sent
     folders, and store them in the Cat's declarative vector memory.
     This function is invoked periodically by the White Rabbit scheduler.
     """
+    lizard = BillTheLizard()
+
+    scheduled_job_id = _get_job_id(cat)
+    lock_acquired = lizard.white_rabbit.acquire_lock(scheduled_job_id)
+    if not lock_acquired:
+        return
+
     log.info("[EmailMonitor] Starting mailbox check...")
     if not settings.imap_username or not settings.imap_password:
         log.warning("[EmailMonitor] IMAP credentials not configured – skipping.")
+        lizard.white_rabbit.release_lock(scheduled_job_id)
         return
 
     # load seen UIDs from the database
-    seen = crud_settings.read(_get_db_key(cat))
+    seen = await crud_settings.read(_get_db_key(cat))
     if not seen:
         seen = {"inbox": [], "sent": []}
 
@@ -214,6 +222,7 @@ def _check_mailbox(settings: EmailMonitorSettings, cat: CheshireCat) -> None:
         conn.login(settings.imap_username, settings.imap_password)
     except Exception as e:
         log.error(f"[EmailMonitor] IMAP connection failed: {e}")
+        lizard.white_rabbit.release_lock(scheduled_job_id)
         return
 
     all_documents: list[Document] = []
@@ -240,6 +249,7 @@ def _check_mailbox(settings: EmailMonitorSettings, cat: CheshireCat) -> None:
         all_documents.extend(sent_docs)
         seen["sent"] = list(set(seen.get("sent", []) + sent_new_uids))
     finally:
+        lizard.white_rabbit.release_lock(scheduled_job_id)
         try:
             conn.logout()
         except Exception:
@@ -247,25 +257,28 @@ def _check_mailbox(settings: EmailMonitorSettings, cat: CheshireCat) -> None:
 
     if not all_documents:
         log.info("[EmailMonitor] No new emails to store.")
-        _save_seen_uids(cat, seen)
+        await _save_seen_uids(cat, seen)
+        lizard.white_rabbit.release_lock(scheduled_job_id)
         return
 
     # Store documents in the declarative (vector) memory via the RabbitHole
     log.info(f"[EmailMonitor] Storing {len(all_documents)} email(s) into declarative memory...")
     try:
         # Use the RabbitHole ingestion pipeline to chunk and embed the documents
-        cat.rabbit_hole.store_documents(
+        await cat.rabbit_hole.store_documents(
             docs=all_documents, source=settings.memory_source_tag, file_hash=None, metadata={}
         )
-        _save_seen_uids(cat, seen)
+        await _save_seen_uids(cat, seen)
         log.info("[EmailMonitor] Email(s) successfully stored in memory.")
     except Exception as e:
         log.error(f"[EmailMonitor] Error storing documents in memory: {e}")
+    finally:
+        lizard.white_rabbit.release_lock(scheduled_job_id)
 
 
-def _setup_email_monitor_schedule(cat: CheshireCat, job_id: str) -> None:
+async def _setup_email_monitor_schedule(cat: CheshireCat, job_id: str) -> None:
     """Setup or update the White Rabbit scheduled job for EmailMonitoring."""
-    raw_settings = cat.mad_hatter.get_plugin().load_settings()
+    raw_settings = await cat.mad_hatter.get_plugin().load_settings()
     try:
         settings = EmailMonitorSettings(**raw_settings)
         interval_minutes = settings.poll_interval_minutes
@@ -276,7 +289,7 @@ def _setup_email_monitor_schedule(cat: CheshireCat, job_id: str) -> None:
 
         log.info(f"EmailMonitor Plugin activated. Scheduling mailbox check every {interval_minutes} minute(s).")
 
-        lizard = BillTheLizard()
+        lizard = cat.lizard
 
         # Avoid adding the same job twice
         if lizard.white_rabbit.get_job(job_id):
@@ -316,7 +329,7 @@ def _remove_email_monitor_schedule(job_id: str) -> None:
 
 
 @hook(priority=1)
-def after_plugin_toggling_on_agent(plugin_id: str, cat: CheshireCat) -> None:
+async def after_plugin_toggling_on_agent(plugin_id: str, cat: CheshireCat) -> None:
     """
     Schedule the periodic mailbox check when the plugin is activated.
     """
@@ -326,14 +339,14 @@ def after_plugin_toggling_on_agent(plugin_id: str, cat: CheshireCat) -> None:
     job_id = _get_job_id(cat)
 
     if plugin_id in cat.mad_hatter.active_plugins:
-        _setup_email_monitor_schedule(cat, job_id)
+        await _setup_email_monitor_schedule(cat, job_id)
         return
 
     _remove_email_monitor_schedule(job_id)
 
 
 @hook(priority=0)
-def after_plugin_settings_update(plugin_id: str, settings: Dict[str, Any], cat: CheshireCat) -> None:
+async def after_plugin_settings_update(plugin_id: str, settings: Dict[str, Any], cat: CheshireCat) -> None:
     """Hook called when plugin settings are updated — replaces the cron job with the new config."""
     if plugin_id != cat.mad_hatter.get_plugin().id:
         return
@@ -344,4 +357,4 @@ def after_plugin_settings_update(plugin_id: str, settings: Dict[str, Any], cat: 
     _remove_email_monitor_schedule(job_id)
 
     # Schedule a fresh job with the updated settings
-    _setup_email_monitor_schedule(cat, job_id)
+    await _setup_email_monitor_schedule(cat, job_id)
