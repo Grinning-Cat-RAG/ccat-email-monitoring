@@ -1,0 +1,7 @@
+[project]
+name = "ccat-email-monitoring"
+version = "0.1.0"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "imapclient>=2.3.1",
+]
