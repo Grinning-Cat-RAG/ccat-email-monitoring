@@ -7,7 +7,7 @@ their content into the Cat's declarative vector memory.
 import imaplib
 import email
 import email.header
-import time
+import asyncio
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Dict, List, Any, Tuple
@@ -18,7 +18,11 @@ from cat.core_plugins.white_rabbit.white_rabbit import JobStatus
 from cat.log import log
 from cat import hook, CheshireCat, BillTheLizard
 from cat.db.cruds.settings import crud as crud_settings
-from cat.plugins.ccat_email_monitoring.settings import EmailMonitorSettings
+from .settings import EmailMonitorSettings
+
+
+# while the mailbox check of the agent runs, its replacement checks it again after this many seconds
+JOB_POLL_SECONDS = 5
 
 
 def _get_job_id(cat: CheshireCat) -> str:
@@ -309,7 +313,7 @@ async def _setup_email_monitor_schedule(cat: CheshireCat, job_id: str) -> None:
         log.error(f"Failed to setup scheduled EmailMonitor job: {str(e)}")
 
 
-def _remove_email_monitor_schedule(job_id: str) -> None:
+async def _remove_email_monitor_schedule(job_id: str) -> None:
     log.info("EmailMonitor Plugin: removing scheduled job.")
     lizard = BillTheLizard()
 
@@ -325,7 +329,8 @@ def _remove_email_monitor_schedule(job_id: str) -> None:
             return
 
         log.debug(f"EmailMonitor job '{job_id}' is still running, waiting before replacing...")
-        time.sleep(5)
+        # asynchronous: the event loop serves the other requests while the check runs
+        await asyncio.sleep(JOB_POLL_SECONDS)
 
 
 @hook(priority=1)
@@ -342,7 +347,7 @@ async def after_plugin_toggling_on_agent(plugin_id: str, cat: CheshireCat) -> No
         await _setup_email_monitor_schedule(cat, job_id)
         return
 
-    _remove_email_monitor_schedule(job_id)
+    await _remove_email_monitor_schedule(job_id)
 
 
 @hook(priority=0)
@@ -354,7 +359,7 @@ async def after_plugin_settings_update(plugin_id: str, settings: Dict[str, Any],
     job_id = _get_job_id(cat)
 
     # Remove the existing job
-    _remove_email_monitor_schedule(job_id)
+    await _remove_email_monitor_schedule(job_id)
 
     # Schedule a fresh job with the updated settings
     await _setup_email_monitor_schedule(cat, job_id)
