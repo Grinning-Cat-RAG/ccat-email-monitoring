@@ -1,7 +1,7 @@
 from typing import Dict, Any
 from pydantic import BaseModel, Field
 
-from cat import plugin
+from cat import plugin, log
 from cat.db.cruds import plugins as crud_plugins
 from cat.services.string_crypto import StringCrypto
 
