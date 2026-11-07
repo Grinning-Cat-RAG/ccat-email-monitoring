@@ -823,6 +823,41 @@ class TestMailboxEdges(unittest.TestCase):
     def setUpClass(cls):
         _load()
 
+    def test_the_imap_calls_do_not_block_the_event_loop(self):
+        """Regression: imaplib is blocking: a slow server (up to the 60 s timeout per operation) froze every agent
+        and chat of the instance while the check waited for it."""
+        import time
+
+        h = Harness()
+        h.server.folders["INBOX"].append(build_email())
+        original = Client.uid
+
+        def slow(client, command, *args):
+            time.sleep(0.3)
+            return original(client, command, *args)
+
+        ticks = 0
+
+        async def heartbeat():
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.01)
+                ticks += 1
+
+        async def check_with_heartbeat():
+            beat = asyncio.create_task(heartbeat())
+            try:
+                await MODULE._check_mailbox(h.settings, h.cat)
+            finally:
+                beat.cancel()
+
+        with patch.object(Client, "uid", slow), patch.object(MODULE, "BillTheLizard", return_value=h.lizard), \
+                patch.object(MODULE, "crud_settings", h.crud), patch.object(MODULE, "_clock", lambda: h.clock), \
+                patch.object(MODULE.imaplib, "IMAP4_SSL", h.server.client):
+            asyncio.run(check_with_heartbeat())
+        self.assertEqual(len(h.db.points), 1)
+        self.assertGreater(ticks, 30, "other coroutines run while the server answers (2 calls of 0.3 s)")
+
     def test_the_clock_is_monotonic(self):
         self.assertLessEqual(MODULE._clock(), MODULE._clock())
 

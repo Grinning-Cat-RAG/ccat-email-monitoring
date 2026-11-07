@@ -117,7 +117,7 @@ def _decrypted(stored: Dict[str, Any], agent_id: str) -> Dict[str, Any]:
     settings, failed = decrypt_secrets(stored, StringCrypto())
     for key in failed:
         log.error(
-            f"[connectors] agent {agent_id}: cannot decrypt '{key}' (was CAT_CRYPTO_KEY changed?): "
+            f"[EmailMonitor] agent {agent_id}: cannot decrypt '{key}' (was CAT_CRYPTO_KEY changed?): "
             "it is ignored until saved again"
         )
     return settings

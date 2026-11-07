@@ -39,7 +39,8 @@ from .settings import EmailMonitorSettings
 JOB_POLL_SECONDS = 5
 # an email that fails this many times is not tried again (its failed attachments, or the whole email, are given up)
 MAX_ATTEMPTS = 3
-# every operation on the IMAP server (connection included) gives up after this many seconds
+# every operation on the IMAP server (connection included) gives up after this many seconds; imaplib is blocking:
+# its calls run in a thread, one at a time, the event loop of the instance keeps serving the other agents and chats
 IMAP_TIMEOUT_SECONDS = 60
 # the folders checked: (type, name of the setting with the IMAP folder name)
 FOLDERS = (("inbox", "inbox_folder"), ("sent", "sent_folder"))
@@ -704,7 +705,7 @@ async def _process_email(
     try:
         plan = None
         try:
-            raw = _fetch(conn, uid)
+            raw = await asyncio.to_thread(_fetch, conn, uid)
             if raw is None:
                 raise ValueError("the server did not return it")
             plan = _plan_email(email.message_from_bytes(raw), uid, folder_type, uidvalidity, settings, handlers)
@@ -739,7 +740,7 @@ async def _check_folder(
 ) -> bool:
     """Store the new emails of a folder, oldest first, until the time is over. Returns False when the time is over.
     A new UIDVALIDITY makes the UIDs stored meaningless: the folder is deleted from memory and read again."""
-    status, _ = conn.select(_imap_folder(folder), readonly=True)
+    status, _ = await asyncio.to_thread(conn.select, _imap_folder(folder), readonly=True)
     if status != "OK":
         log.warning(f"[EmailMonitor] Could not select folder '{folder}'")
         return True
@@ -754,7 +755,7 @@ async def _check_folder(
         states[folder_type] = state = {"uidvalidity": uidvalidity, "done": [], "attempts": {}}
         await _save_state(cat, states)
 
-    status, data = conn.uid("SEARCH", None, "ALL")
+    status, data = await asyncio.to_thread(conn.uid, "SEARCH", None, "ALL")
     if status != "OK":
         log.warning(f"[EmailMonitor] UID SEARCH failed in folder '{folder}'")
         return True
@@ -826,7 +827,7 @@ async def _run_check(lizard: BillTheLizard, settings: EmailMonitorSettings, cat:
     stored = await crud_settings.read(_get_db_key(cat)) or {}
     states = {folder_type: _folder_state(stored.get(folder_type)) for folder_type, _ in FOLDERS}
     try:
-        conn = _connect(settings)
+        conn = await asyncio.to_thread(_connect, settings)
     except Exception as e:
         log.error(f"[EmailMonitor] IMAP connection failed: {e}")
         return
@@ -841,7 +842,7 @@ async def _run_check(lizard: BillTheLizard, settings: EmailMonitorSettings, cat:
     except Exception as e:
         log.error(f"[EmailMonitor] Mailbox check interrupted: {e}")
     finally:
-        _logout(conn)
+        await asyncio.to_thread(_logout, conn)
 
 
 async def _check_mailbox(settings: EmailMonitorSettings, cat: CheshireCat) -> None:

@@ -1,6 +1,6 @@
 from typing import Any, Dict, List, Protocol, Tuple
 
-#: settings encrypted at rest: every field whose key contains "_secret"
+#: settings encrypted at rest: the keys listed here
 SECRET_SETTINGS = ("imap_password",)
 
 
