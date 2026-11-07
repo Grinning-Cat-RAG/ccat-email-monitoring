@@ -65,8 +65,10 @@ Gmail's Sent folder is named `[Gmail]/Sent Mail`.
 
 ```
 ccat_email_monitoring/
-├── email_monitor.py        # Core logic (hooks, monitoring, IMAP handling)
+├── email_monitor.py        # Core logic (hooks, monitoring, IMAP handling, body extraction)
 ├── settings.py             # Pydantic settings model
+├── crypt.py                # Encryption at rest of the secret settings
+├── tests/                  # Test suite (run from the core root)
 ├── plugin.json             # Plugin manifest
 └── README.md               # This guide
 ```
@@ -89,6 +91,18 @@ Hi,
 I'm writing to confirm the meeting scheduled for...
 ```
 
+The body is made of the `text/plain` and `text/html` parts of the email that are not attachments, in order, the HTML
+converted to plain text as a browser shows it: scripts and styles dropped, entities decoded, paragraphs and line
+breaks kept (a `<div>` is a new line, `<br><br>` a blank line), the address of a link after its text, images
+replaced by their alternative text. Of each `multipart/alternative` (the same content in more formats) only one
+choice is used: the last one made of `text/plain` parts only, else the last one with some text. Attachments, and
+everything inside them (e.g. an attached email), are ignored; an inline forwarded email is part of the body, the
+copy of the bounced email in a delivery report is not. An email without text in a `text/plain` or `text/html` part
+is stored with the body `(empty body)`.
+Charsets are read as browsers and mail clients read them (WHATWG Encoding standard): a missing or unknown charset,
+and an ASCII or latin-1 one, is read as UTF-8 when the text is valid UTF-8, else as windows-1252; the same goes for
+the headers (RFC 2047 encoded words, raw 8-bit bytes). The body is truncated at **Max Body Length** characters.
+
 Each document carries the following metadata:
 
 - `source`: configurable tag (default `email_monitor`)
@@ -102,14 +116,14 @@ Each document carries the following metadata:
 
 ## Removing Emails from Memory
 
-To delete all stored emails from the vector memory, use the Cat's declarative memory API:
+To delete all stored emails from the vector memory, delete the declarative points by their source tag
+(use the configured **Memory Source Tag**):
 
 ```python
-declarative_memory = cat.memory.vectors.declarative
-declarative_memory.delete_points_by_metadata_filter(
-    metadata={"source": "email_monitor"}
-)
+await cat.vector_memory_handler.delete_tenant_points("declarative", metadata={"source": "email_monitor"})
 ```
+
+The UIDs of the deleted emails stay recorded as processed: they are not ingested again.
 
 ---
 
@@ -126,7 +140,7 @@ The plugin uses the **White Rabbit** core plugin to schedule periodic mailbox ch
 
 ## Security
 
-- The IMAP password is stored in the plugin's settings (managed by the Cat). Using a dedicated **App Password** is strongly recommended.
+- The IMAP password is stored in the plugin's settings (managed by the Cat), encrypted at rest. Using a dedicated **App Password** is strongly recommended.
 - The plugin connects in **read-only mode** (`readonly=True`) to all IMAP folders: it never modifies, moves, or deletes any email.
 - Already-processed email UIDs are stored in the database using the Cat's CRUD settings system.
 
