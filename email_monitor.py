@@ -628,7 +628,7 @@ async def _purge(cat: CheshireCat, metadata: Dict, sources: List[str] = ()) -> N
 
 
 async def _ingest(cat: CheshireCat, engine: Any, file: _EmailFile) -> bool:
-    """Ingest a file through the engine of the core, as an upload is. The engine logs and swallows its errors (a
+    """Ingest a file through the RabbitHole of the core, as an upload is. It logs and swallows its errors (a
     file it cannot parse, an embedder down): the file is stored when it has points."""
     await engine.ingest_file(cat=cat, file=BytesIO(file.data), filename=file.source, metadata=file.metadata,
                              store_file=True, content_type=file.content_type)
@@ -832,7 +832,7 @@ async def _run_check(lizard: BillTheLizard, settings: EmailMonitorSettings, cat:
         log.error(f"[EmailMonitor] IMAP connection failed: {e}")
         return
     try:
-        engine = await lizard.ingestion()
+        engine = lizard.rabbit_hole
         handlers = await cat.file_handlers()
         deadline = _clock() + settings.cycle_budget_minutes * 60
         for folder_type, setting in FOLDERS:
@@ -848,7 +848,7 @@ async def _run_check(lizard: BillTheLizard, settings: EmailMonitorSettings, cat:
 async def _check_mailbox(settings: EmailMonitorSettings, cat: CheshireCat) -> None:
     """
     Store the new emails of the inbox and sent folders in the declarative memory of the agent, as files (the body
-    as a text file, the attachments when enabled) ingested by the engine of the core: a change of embedder
+    as a text file, the attachments when enabled) ingested by the RabbitHole of the core: a change of embedder
     re-embeds them. Invoked periodically by the White Rabbit; one check at a time per agent (the lock, held until
     everything is stored).
     """

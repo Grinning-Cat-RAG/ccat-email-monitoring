@@ -1,5 +1,5 @@
 """The mailbox check, end to end on fakes of the IMAP server and of the Cat: every email is stored as files (its body
-as a .txt, its attachments when enabled) through the ingestion engine of the core, so that a change of embedder
+as a .txt, its attachments when enabled) through the RabbitHole of the core, so that a change of embedder
 re-embeds them; per-email attempts, cleanup, UIDVALIDITY, time budget, lock.
 
 Run from the core root: ``python -m pytest cat/plugins/ccat-email-monitoring/tests``.
@@ -214,7 +214,7 @@ class FileManager:
 
 
 class Engine:
-    """The ingestion engine of the core, synchronous: stores the file first, then parses, embeds and stores the
+    """The RabbitHole of the core (``lizard.rabbit_hole``), synchronous: stores the file first, then parses, embeds and stores the
     points (one per file here), firing ``before_rabbithole_stores_documents``. It swallows its own errors, as the
     core does; faults: "zero" (no points: the file cannot be parsed, the embedder is down), "crash" (the container
     restarts)."""
@@ -227,7 +227,7 @@ class Engine:
         self.break_next = None  # the next file ingested gets broken with this fault
         self.calls = []  # (source, clock at the start)
 
-    async def ingest_file(self, cat, file, filename=None, metadata=None, store_file=True, content_type=None):
+    async def ingest_file(self, cat, file, metadata, filename=None, store_file=True, content_type=None):
         from langchain_core.documents import Document
 
         h = self.harness
@@ -307,12 +307,8 @@ class Harness:
             return dict(self.handlers)
 
         self.cat.file_handlers = file_handlers
-        self.lizard = MagicMock(white_rabbit=self.rabbit)
-
-        async def ingestion():
-            return self.engine
-
-        self.lizard.ingestion = ingestion
+        # the lizard of the core: its RabbitHole is the ingestion engine (no ``ingestion()`` factory any more)
+        self.lizard = MagicMock(spec=["white_rabbit", "rabbit_hole"], white_rabbit=self.rabbit, rabbit_hole=self.engine)
         self.cat.lizard = self.lizard
         values = {"imap_username": "u", "imap_password": "p", "inbox_folder": "INBOX", "sent_folder": "Sent",
                   "ingest_attachments": True, "attachment_max_mb": 1, "attachment_max_count": 20,
@@ -822,6 +818,18 @@ class TestMailboxEdges(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         _load()
+
+    def test_the_fake_rabbit_hole_has_the_signature_of_the_core(self):
+        """The fake stands for ``RabbitHole.ingest_file`` of the core: same parameters, same order and defaults,
+        so a change of the core API breaks this test instead of passing unseen on the fake."""
+        import inspect
+        from cat.rabbit_hole import RabbitHole
+
+        def params(fn):
+            return [(p.name, p.kind, p.default) for p in inspect.signature(fn).parameters.values()]
+
+        self.assertEqual(params(Engine.ingest_file), params(RabbitHole.ingest_file))
+        self.assertTrue(inspect.iscoroutinefunction(RabbitHole.ingest_file))
 
     def test_the_imap_calls_do_not_block_the_event_loop(self):
         """Regression: imaplib is blocking: a slow server (up to the 60 s timeout per operation) froze every agent

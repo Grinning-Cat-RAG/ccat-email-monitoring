@@ -9,7 +9,7 @@ Monitors an email mailbox via IMAP and automatically stores every **incoming** (
 1. The plugin connects to the IMAP server using the credentials configured in the plugin *Settings* (every IMAP
    operation gives up after 60 seconds).
 2. It periodically scans (every N minutes, configurable) both the Inbox and Sent folders, oldest email first.
-3. Every new email is stored as **files** through the ingestion engine of the core, as an upload is: its body as a
+3. Every new email is stored as **files** through the RabbitHole of the core, as an upload is: its body as a
    text file, and its attachments when **Ingest Attachments** is on. The files are kept in the file storage of the
    agent, so a **change of embedder re-embeds them** like any uploaded file.
 4. The state of each folder (its UIDVALIDITY, the UIDs done, the failed attempts) is saved in the database after
