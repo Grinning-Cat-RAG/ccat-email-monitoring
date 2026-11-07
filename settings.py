@@ -75,6 +75,43 @@ class EmailMonitorSettings(BaseModel):
         le=50000,
     )
 
+    # Attachments
+    ingest_attachments: bool = Field(
+        title="Ingest Attachments",
+        description="Store the attachments of the emails in memory too (off: the first check after turning it on "
+                    "stores only the attachments of the emails not stored yet)",
+        default=False,
+    )
+    attachment_max_mb: int = Field(
+        title="Max Attachment Size (MB)",
+        description="Attachments larger than this are skipped",
+        default=20,
+        ge=1,
+        le=100,
+    )
+    attachment_max_count: int = Field(
+        title="Max Attachments per Email",
+        description="Only the first attachments of an email, up to this many, are stored",
+        default=20,
+        ge=0,
+        le=100,
+    )
+    attachment_excluded_types: str = Field(
+        title="Excluded Attachment Types",
+        description='MIME types of the attachments never stored, comma separated (e.g. "image/png, text/csv"): '
+                    "matched against the declared type and the type recognised from the content",
+        default="",
+    )
+
+    # Time budget of a check
+    cycle_budget_minutes: int = Field(
+        title="Check Time Budget (minutes)",
+        description="A check starts no new email after this many minutes (the email it is storing is completed)",
+        default=10,
+        ge=1,
+        le=50,
+    )
+
 
 def _decrypted(stored: Dict[str, Any], agent_id: str) -> Dict[str, Any]:
     settings, failed = decrypt_secrets(stored, StringCrypto())

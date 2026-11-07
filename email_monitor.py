@@ -11,12 +11,18 @@ import imaplib
 import email
 import email.header
 import asyncio
+import mimetypes
+import os
 import quopri
 import re
+import time
+import unicodedata
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.message import Message
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
+from io import BytesIO
 from typing import Dict, List, Any, Tuple
 
 from langchain_core.documents import Document
@@ -25,11 +31,28 @@ from cat.core_plugins.white_rabbit.white_rabbit import JobStatus
 from cat.log import log
 from cat import hook, CheshireCat, BillTheLizard
 from cat.db.cruds.settings import crud as crud_settings
+from cat.utils import guess_file_type
 from .settings import EmailMonitorSettings
 
 
 # while the mailbox check of the agent runs, its replacement checks it again after this many seconds
 JOB_POLL_SECONDS = 5
+# an email that fails this many times is not tried again (its failed attachments, or the whole email, are given up)
+MAX_ATTEMPTS = 3
+# every operation on the IMAP server (connection included) gives up after this many seconds
+IMAP_TIMEOUT_SECONDS = 60
+# the folders checked: (type, name of the setting with the IMAP folder name)
+FOLDERS = (("inbox", "inbox_folder"), ("sent", "sent_folder"))
+# the collection of the documents
+DECLARATIVE = "declarative"
+# a service is unreachable (the IMAP server, the vector DB...): the check ends, the email being stored is not a
+# failed attempt (it is not its fault) and is tried again at the next check
+_CONNECTION_LOST = (TimeoutError, OSError, imaplib.IMAP4.abort)
+
+
+def _clock() -> float:
+    """Seconds of a monotonic clock: the time budget of a check."""
+    return time.monotonic()
 
 
 def _get_job_id(cat: CheshireCat) -> str:
@@ -40,12 +63,21 @@ def _get_db_key(cat: CheshireCat) -> str:
     return f"plugins:{_get_job_id(cat)}:seen"
 
 
-async def _save_seen_uids(cat: CheshireCat, seen: Dict[str, Any]) -> None:
-    """Persist already-processed UIDs to disk."""
+async def _save_state(cat: CheshireCat, state: Dict[str, Any]) -> None:
+    """Persist the state of the folders. A failure is logged: the next check does again what it lost (every email
+    is cleaned before being stored)."""
     try:
-        await crud_settings.store(_get_db_key(cat), seen)
+        await crud_settings.store(_get_db_key(cat), state)
     except Exception as e:
-        log.error(f"[EmailMonitor] Error saving seen UIDs: {e}")
+        log.error(f"[EmailMonitor] Error saving the state of the mailbox: {e}")
+
+
+def _folder_state(raw: Any) -> Dict[str, Any]:
+    """The state of a folder: its UIDVALIDITY, the UIDs done (stored, or given up) and the failed attempts of the
+    others; none yet (the first check), or the state of the previous version, is an empty folder."""
+    if isinstance(raw, dict) and "uidvalidity" in raw:
+        return raw
+    return {"uidvalidity": None, "done": [], "attempts": {}}  # also the list of UIDs of the previous version
 
 
 # charset labels read as the WHATWG Encoding standard (the browsers, the mail clients) reads them, where Python
@@ -366,214 +398,483 @@ def _extract_text_body(msg: Message) -> str:
     return "\n\n".join(text for text, _ in _body_texts(msg))
 
 
+def _slug(text: str, limit: int) -> str:
+    """``text`` as a piece of a file name: ASCII letters, digits, ``_`` and ``-`` only (the core replaces dots and
+    spaces of a file name, so a name made of these is stored as it is), at most ``limit`` characters."""
+    ascii_text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^A-Za-z0-9_-]+", "_", ascii_text).strip("_")[:limit].strip("_")
+
+
+def _tag(settings: EmailMonitorSettings) -> str:
+    return _slug(settings.memory_source_tag, 30) or "email"
+
+
+def _folder_prefix(settings: EmailMonitorSettings, folder_type: str, uidvalidity: str) -> str:
+    """The start of the names of the files of the emails of a folder under a UIDVALIDITY."""
+    return f"{_tag(settings)}_{folder_type}_{_slug(uidvalidity, 20) or '0'}_"
+
+
+def _stored_files(cat: CheshireCat, prefix: str) -> List[str]:
+    """The names of the stored files of the agent starting with ``prefix`` (only when their names cannot be
+    computed: it lists every file of the agent)."""
+    return [f.name for f in cat.file_manager.list_files(cat.agent_key) if f.name.startswith(prefix)]
+
+
+def _email_headers(msg: Message) -> Dict[str, Any]:
+    """The decoded headers of an email; a missing or unreadable date is now."""
+    date_str = msg.get("Date", "")
+    try:
+        date_obj = parsedate_to_datetime(str(date_str)) if date_str else datetime.now(timezone.utc)
+    except Exception:
+        date_obj = datetime.now(timezone.utc)
+    return {
+        "subject": _decode_header_value(msg.get("Subject", "(no subject)")),
+        "from": _decode_header_value(msg.get("From", "")),
+        "to": _decode_header_value(msg.get("To", "")),
+        "cc": _decode_header_value(msg.get("Cc", "")),
+        "date": date_obj,
+        "message_id": _decode_header_value(msg.get("Message-ID", "")).strip(),
+    }
+
+
 def _build_document(
-    msg: email.message.Message,
+    msg: Message,
     uid: str,
     folder_type: str,  # "inbox" or "sent"
     settings: EmailMonitorSettings,
-) -> Document | None:
+    uidvalidity: str = "0",
+) -> Document:
     """
-    Build a LangChain Document from an email message, ready for
-    insertion into the Cat's declarative memory.
+    The body of an email as a document: its text (the headers, then the body, truncated at ``max_body_length``) and
+    the metadata shared by every file of the email.
     """
-    try:
-        subject = _decode_header_value(msg.get("Subject", "(no subject)"))
-        from_addr = _decode_header_value(msg.get("From", ""))
-        to_addr = _decode_header_value(msg.get("To", ""))
-        cc_addr = _decode_header_value(msg.get("Cc", ""))
-        date_str = msg.get("Date", "")
+    headers = _email_headers(msg)
+    body = _extract_text_body(msg) or "(empty body)"
+    if len(body) > settings.max_body_length:
+        body = body[: settings.max_body_length] + "\n... [truncated]"
 
-        try:
-            date_obj = parsedate_to_datetime(date_str) if date_str else datetime.now(timezone.utc)
-        except Exception:
-            date_obj = datetime.now(timezone.utc)
+    direction = "RECEIVED" if folder_type == "inbox" else "SENT"
+    page_content = (
+        f"[EMAIL - {direction}]\n"
+        f"Date: {headers['date'].isoformat()}\n"
+        f"From: {headers['from']}\n"
+        f"To: {headers['to']}\n"
+        f"Cc: {headers['cc']}\n"
+        f"Subject: {headers['subject']}\n"
+        f"\n{body}"
+    )
+    metadata = {
+        "email_source_tag": settings.memory_source_tag,
+        "email_uid": uid,
+        "email_folder": folder_type,
+        "email_uidvalidity": uidvalidity,
+        "email_direction": direction,
+        "email_subject": headers["subject"],
+        "email_from": headers["from"],
+        "email_to": headers["to"],
+        "email_date": headers["date"].isoformat(),
+        "email_message_id": headers["message_id"],
+    }
+    return Document(page_content=page_content, metadata=metadata)
 
-        body = _extract_text_body(msg)
-        if not body:
-            body = "(empty body)"
 
-        # Truncate body if needed
-        if len(body) > settings.max_body_length:
-            body = body[: settings.max_body_length] + "\n... [truncated]"
+def _message_text(msg: Message) -> str:
+    """Text of an attached email: its headers and its body (not its attachments), as this plugin reads them."""
+    headers = _email_headers(msg)
+    return (
+        f"From: {headers['from']}\nTo: {headers['to']}\nCc: {headers['cc']}\n"
+        f"Date: {headers['date'].isoformat()}\nSubject: {headers['subject']}\n\n{_extract_text_body(msg)}"
+    ).strip()
 
-        # Build the textual representation stored in memory
-        direction = "RECEIVED" if folder_type == "inbox" else "SENT"
-        page_content = (
-            f"[EMAIL - {direction}]\n"
-            f"Date: {date_obj.isoformat()}\n"
-            f"From: {from_addr}\n"
-            f"To: {to_addr}\n"
-            f"Cc: {cc_addr}\n"
-            f"Subject: {subject}\n"
-            f"\n{body}"
-        )
 
-        metadata = {
-            "source": settings.memory_source_tag,
-            "when": date_obj.timestamp(),
-            "email_uid": uid,
-            "email_folder": folder_type,
-            "email_direction": direction,
-            "email_subject": subject,
-            "email_from": from_addr,
-            "email_to": to_addr,
-            "email_date": date_obj.isoformat(),
-        }
+def _attachment_parts(part: Message, found: List[Message]) -> None:
+    """
+    The attachments of ``part``, in order: the parts with an ``attachment`` disposition (an attached email is one
+    attachment), and the inline leaves with a file name that are not text of the body nor an inline image of it
+    (an image with a Content-ID: logos, signatures). Nothing inside an attachment, nor the bounced email of a delivery
+    report; the attachments of an inline forwarded email are attachments of the email.
+    """
+    if part.get_content_disposition() == "attachment":
+        found.append(part)
+        return
+    if part.is_multipart():
+        for child in part.get_payload():
+            if part.get_content_type() == "multipart/report" and child.get_content_maintype() == "message":
+                continue
+            _attachment_parts(child, found)
+        return
+    if part.get_content_type() in ("text/plain", "text/html") or not part.get_filename():
+        return
+    if part.get_content_maintype() == "image" and part.get("Content-ID"):
+        return
+    found.append(part)
 
-        return Document(page_content=page_content, metadata=metadata)
 
-    except Exception as e:
-        log.error(f"[EmailMonitor] Error building document for UID {uid}: {e}")
+@dataclass
+class _EmailFile:
+    """A file of an email for the ingestion engine: the body, or an attachment."""
+    source: str  # unique name of the file, also the ``source`` of its points
+    name: str  # the name shown (the file name of the attachment)
+    data: bytes
+    content_type: str
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class _EmailPlan:
+    body: Document
+    body_source: str
+    attachments: List[_EmailFile]
+    skipped: List[Dict[str, str]]
+    # the names of the files of every attachment, also the skipped ones: what a crashed attempt may have stored
+    # under other settings (e.g. attachments turned off after it)
+    attachment_sources: List[str]
+
+    @property
+    def sources(self) -> List[str]:
+        return [self.body_source] + self.attachment_sources
+
+
+def _attachment_name(part: Message, index: int) -> str:
+    raw = part.get_filename()
+    name = _decode_header_value(raw).strip() if raw else ""
+    if not name and part.get_content_type() == "message/rfc822" and part.is_multipart():
+        subject = _decode_header_value(part.get_payload()[0].get("Subject", "")).strip()
+        name = f"{subject}.eml" if subject else ""
+    return name or f"allegato_{index}"
+
+
+def _attachment_source(base: str, name: str, index: int, content_type: str, extension: str = "") -> str:
+    """``<base>_<index>_<slug of the name>.<extension>``: the extension given, else the one of the name when it is
+    one (letters and digits, up to 8), else the one of its type, else ``bin``; no folders of the name."""
+    stem = re.split(r"[\\/]", name)[-1]
+    ext = ""
+    if "." in stem:
+        head, tail = stem.rsplit(".", 1)
+        stem = head
+        if re.fullmatch(r"[A-Za-z0-9]{1,8}", tail):
+            ext = tail
+    ext = extension or ext
+    if not ext:
+        ext = (mimetypes.guess_extension(content_type or "") or ".bin").lstrip(".")
+    return f"{base}_{index}_{_slug(stem, 60) or f'allegato_{index}'}.{ext.lower()}"
+
+
+def _plan_email(
+    msg: Message, uid: str, folder_type: str, uidvalidity: str, settings: EmailMonitorSettings, handlers: Dict,
+) -> _EmailPlan:
+    """The files to store for an email: its attachments to ingest (when enabled), the ones skipped with the
+    reason, its body. Deterministic: the same email gives the same names, that the cleanup of a failed or crashed
+    attempt relies on."""
+    body = _build_document(msg, uid, folder_type, settings, uidvalidity)
+    base = f"{_folder_prefix(settings, folder_type, uidvalidity)}{_slug(uid, 20)}"
+    excluded = {t.strip().lower() for t in settings.attachment_excluded_types.split(",") if t.strip()}
+    parts: List[Message] = []
+    _attachment_parts(msg, parts)
+    attachments: List[_EmailFile] = []
+    skipped: List[Dict[str, str]] = []
+    attachment_sources: List[str] = []
+    for index, part in enumerate(parts, start=1):
+        name = _attachment_name(part, index)
+        if part.get_content_type() == "message/rfc822" and part.is_multipart():
+            mime, content_type = "message/rfc822", "text/plain"
+            data = _message_text(part.get_payload()[0]).encode("utf-8")
+        else:  # (an attached multipart that is not an email has no payload of its own: empty)
+            data = part.get_payload(decode=True) or b""
+            mime = content_type = (guess_file_type(BytesIO(data))[0] or "") if data else ""
+        source = _attachment_source(base, name, index, content_type, "txt" if mime == "message/rfc822" else "")
+        attachment_sources.append(source)
+        reason = None
+        if not settings.ingest_attachments:
+            reason = "disabled"
+        elif not data.strip():  # nothing, or only blanks
+            reason = "empty"
+        elif len(data) > settings.attachment_max_mb * 1024 * 1024:
+            reason = "too_large"
+        elif mime in excluded or part.get_content_type() in excluded:  # text files are all text/plain by bytes
+            reason = "excluded_type"
+        elif not content_type or content_type not in handlers:
+            reason = "unsupported_type"
+        elif len(attachments) >= settings.attachment_max_count:
+            reason = "too_many"
+        if reason:
+            skipped.append({"name": name, "reason": reason})
+            continue
+        attachments.append(_EmailFile(
+            source=source, name=name, data=data, content_type=content_type,
+            metadata=body.metadata | {"email_attachment_filename": name, "email_attachment_index": index,
+                                      "email_attachment_mime": mime},
+        ))
+    return _EmailPlan(body=body, body_source=f"{base}.txt", attachments=attachments, skipped=skipped,
+                      attachment_sources=attachment_sources)
+
+
+def _email_filter(folder_type: str, uidvalidity: str, uid: str | None = None) -> Dict:
+    """The points of the emails of a folder (or of one email), whatever the tag they were stored with."""
+    flt = {"email_folder": folder_type, "email_uidvalidity": uidvalidity}
+    return flt | ({"email_uid": uid} if uid is not None else {})
+
+
+async def _purge(cat: CheshireCat, metadata: Dict, sources: List[str] = ()) -> None:
+    """Delete the points matching ``metadata`` and their files, and the files named ``sources`` (the engine stores a
+    file before parsing it: a file whose parsing failed has no points)."""
+    handler = cat.vector_memory_handler
+    points, _ = await handler.get_all_tenant_points(DECLARATIVE, metadata=metadata, with_vectors=False)
+    names = {p.payload.get("metadata", {}).get("source") for p in points} | set(sources)
+    await handler.delete_tenant_points(DECLARATIVE, metadata=metadata)
+    for name in sorted(n for n in names if n):
+        cat.file_manager.remove_file(os.path.join(cat.agent_key, name))
+
+
+async def _ingest(cat: CheshireCat, engine: Any, file: _EmailFile) -> bool:
+    """Ingest a file through the engine of the core, as an upload is. The engine logs and swallows its errors (a
+    file it cannot parse, an embedder down): the file is stored when it has points."""
+    await engine.ingest_file(cat=cat, file=BytesIO(file.data), filename=file.source, metadata=file.metadata,
+                             store_file=True, content_type=file.content_type)
+    points, _ = await cat.vector_memory_handler.get_all_tenant_points(
+        DECLARATIVE, limit=1, metadata={"source": file.source}, with_vectors=False,
+    )
+    return bool(points)
+
+
+class _ServiceDown(Exception):
+    """The body of an email, plain text that always parses, got no points: the embedder or the vector DB is down."""
+
+
+async def _store_email(cat: CheshireCat, engine: Any, plan: _EmailPlan, last_attempt: bool) -> bool:
+    """Store the files of an email: its attachments, then its body, listing what was ingested, skipped, failed.
+    Returns whether the email is done (on the last attempt the failed attachments are given up, listed in the body);
+    when it is not, the caller deletes all of it. A body without points raises ``_ServiceDown``, nothing of the
+    email left: the engine swallows its errors, the body is what tells a service down from a file nobody can read."""
+    ingested, failed = [], []
+    for file in plan.attachments:
+        (ingested if await _ingest(cat, engine, file) else failed).append(file)
+    body = _EmailFile(
+        source=plan.body_source, name=plan.body_source, data=plan.body.page_content.encode("utf-8"),
+        content_type="text/plain",
+        metadata=plan.body.metadata | {
+            "email_attachments_ingested": [f.name for f in ingested],
+            "email_attachments_skipped": plan.skipped,
+            "email_attachments_failed": [f.name for f in failed],
+        },
+    )
+    if not await _ingest(cat, engine, body):
+        await _purge(cat, _email_filter(plan.body.metadata["email_folder"], plan.body.metadata["email_uidvalidity"],
+                                        plan.body.metadata["email_uid"]), plan.sources)
+        raise _ServiceDown(f"no points for '{body.source}': the embedder or the vector DB is down")
+    if failed and not last_attempt:
+        return False
+    for file in failed:  # stored by the engine, without points
+        cat.file_manager.remove_file(os.path.join(cat.agent_key, file.source))
+    return True
+
+
+def _fetch(conn: imaplib.IMAP4, uid: str) -> bytes | None:
+    status, data = conn.uid("FETCH", uid, "(RFC822)")
+    if status != "OK" or not data or not isinstance(data[0], tuple) or not isinstance(data[0][1], bytes):
         return None
+    return data[0][1]
 
 
-def _fetch_new_emails(
-    conn: imaplib.IMAP4,
-    folder: str,
-    seen_uids: List,
-    folder_type: str,
-    settings: EmailMonitorSettings,
-) -> Tuple[List[Document], List[str]]:
+async def _process_email(
+    conn: imaplib.IMAP4, cat: CheshireCat, engine: Any, settings: EmailMonitorSettings, handlers: Dict,
+    folder_type: str, uidvalidity: str, uid: str, states: Dict[str, Dict[str, Any]],
+) -> None:
     """
-    Select a folder, fetch all unseen UIDs, parse emails and return (list_of_documents, list_of_new_uids).
-    """
-    documents = []
-    new_uids = []
+    One attempt at an email: done (stored, or given up after ``MAX_ATTEMPTS``) or one more failed attempt, with
+    nothing of it left in memory. Whatever was left by a crashed attempt is deleted first.
 
+    The attempt is counted (and saved) before it starts: an email that kills the process (e.g. a malformed
+    attachment that crashes the parser) is given up after ``MAX_ATTEMPTS`` crashes. A service down (the IMAP server, the embedder, the vector DB) is not
+    the fault of the email: the count is restored and the error ends the check.
+    """
+    state = states[folder_type]
+    previous = state["attempts"].get(uid, 0)
+    email_filter = _email_filter(folder_type, uidvalidity, uid)
+    base = f"{_folder_prefix(settings, folder_type, uidvalidity)}{_slug(uid, 20)}"
+    if previous >= MAX_ATTEMPTS:  # the last attempt crashed
+        log.error(f"[EmailMonitor] The email {folder_type}/{uid} failed {previous} times: it is given up")
+        await _purge(cat, email_filter, [n for n in _stored_files(cat, base) if n[len(base)] in "._"])
+        state["done"].append(uid)
+        state["attempts"].pop(uid, None)
+        return
+    attempt = previous + 1
+    state["attempts"][uid] = attempt
+    await _save_state(cat, states)
     try:
-        status, _ = conn.select(folder, readonly=True)
-        if status != "OK":
-            log.warning(f"[EmailMonitor] Could not select folder '{folder}'")
-            return documents, new_uids
+        plan = None
+        try:
+            raw = _fetch(conn, uid)
+            if raw is None:
+                raise ValueError("the server did not return it")
+            plan = _plan_email(email.message_from_bytes(raw), uid, folder_type, uidvalidity, settings, handlers)
+        except _CONNECTION_LOST:
+            raise
+        except Exception as e:  # the email cannot be read
+            log.error(f"[EmailMonitor] Error reading the email {folder_type}/{uid}: {e}")
+        done = False
+        if plan is not None:
+            await _purge(cat, email_filter, plan.sources)
+            done = await _store_email(cat, engine, plan, attempt >= MAX_ATTEMPTS)
+        if not done:
+            sources = plan.sources if plan is not None else [  # unread: the names of its files by their start
+                n for n in _stored_files(cat, base) if n[len(base)] in "._"]
+            await _purge(cat, email_filter, sources)
+    except Exception:
+        if previous:
+            state["attempts"][uid] = previous
+        else:
+            state["attempts"].pop(uid, None)
+        raise
+    if done or attempt >= MAX_ATTEMPTS:
+        if not done:
+            log.error(f"[EmailMonitor] The email {folder_type}/{uid} failed {attempt} times: it is given up")
+        state["done"].append(uid)
+        state["attempts"].pop(uid, None)
 
-        # Search for ALL messages; we filter already-seen ones ourselves
-        status, data = conn.uid("SEARCH", None, "ALL")
-        if status != "OK":
-            log.warning(f"[EmailMonitor] UID SEARCH failed in folder '{folder}'")
-            return documents, new_uids
 
-        all_uids = data[0].split() if data[0] else []
-        # Keep only UIDs we have not processed yet
-        unseen = [u.decode() for u in all_uids if u.decode() not in seen_uids]
+async def _check_folder(
+    conn: imaplib.IMAP4, cat: CheshireCat, engine: Any, settings: EmailMonitorSettings, handlers: Dict,
+    folder_type: str, folder: str, states: Dict[str, Dict[str, Any]], deadline: float,
+) -> bool:
+    """Store the new emails of a folder, oldest first, until the time is over. Returns False when the time is over.
+    A new UIDVALIDITY makes the UIDs stored meaningless: the folder is deleted from memory and read again."""
+    status, _ = conn.select(_imap_folder(folder), readonly=True)
+    if status != "OK":
+        log.warning(f"[EmailMonitor] Could not select folder '{folder}'")
+        return True
+    uidvalidity = conn.response("UIDVALIDITY")[1][0].decode()  # in every SELECT response (RFC 3501)
+    state = states[folder_type]
+    if state["uidvalidity"] != uidvalidity:
+        if state["uidvalidity"] is not None:
+            log.warning(f"[EmailMonitor] UIDVALIDITY of '{folder}' changed: the folder is read again")
+            # the files by name too: a crashed attempt may have left one without points
+            await _purge(cat, _email_filter(folder_type, state["uidvalidity"]),
+                         _stored_files(cat, _folder_prefix(settings, folder_type, state["uidvalidity"])))
+        states[folder_type] = state = {"uidvalidity": uidvalidity, "done": [], "attempts": {}}
+        await _save_state(cat, states)
 
-        if not unseen:
-            return documents, new_uids
+    status, data = conn.uid("SEARCH", None, "ALL")
+    if status != "OK":
+        log.warning(f"[EmailMonitor] UID SEARCH failed in folder '{folder}'")
+        return True
+    done = set(state["done"])
+    uids = sorted({u.decode() for u in (data[0] or b"").split()} - done, key=int) if data else []
+    if uids:
+        log.info(f"[EmailMonitor] {len(uids)} new email(s) found in '{folder}'")
+    for uid in uids:
+        if _clock() >= deadline:  # checked before an email only: the started one ends, no email is left half
+            log.info("[EmailMonitor] Time budget over: the other emails at the next check")
+            return False
+        try:
+            await _process_email(conn, cat, engine, settings, handlers, folder_type, uidvalidity, uid, states)
+        finally:  # the count restored when a service is down
+            await _save_state(cat, states)
+    return True
 
-        log.info(f"[EmailMonitor] {len(unseen)} new email(s) found in '{folder}'")
 
-        for uid in unseen:
-            try:
-                status, msg_data = conn.uid("FETCH", uid, "(RFC822)")
-                if status != "OK" or not msg_data or not msg_data[0]:
-                    continue
+def _imap_folder(name: str) -> str:
+    """A folder name as IMAP wants it: modified UTF-7 (RFC 3501 5.1.3), quoted (imaplib sends the arguments as they
+    are: a name with spaces or brackets, like Gmail's "[Gmail]/Sent Mail", is otherwise a BAD command)."""
+    out: List[str] = []
+    pending: List[str] = []  # the characters to encode
 
-                raw = msg_data[0][1]
-                if not isinstance(raw, bytes):
-                    continue
+    def flush() -> None:
+        if pending:
+            encoded = base64.b64encode("".join(pending).encode("utf-16-be")).decode("ascii")
+            out.append("&" + encoded.rstrip("=").replace("/", ",") + "-")
+            pending.clear()
 
-                msg = email.message_from_bytes(raw)
-                doc = _build_document(msg, uid, folder_type, settings)
-                if doc:
-                    documents.append(doc)
-                    new_uids.append(uid)
-            except Exception as e:
-                log.error(f"[EmailMonitor] Error fetching UID {uid}: {e}")
+    for char in name:
+        if " " <= char <= "~":
+            flush()
+            out.append("&-" if char == "&" else char)
+        else:
+            pending.append(char)
+    flush()
+    escaped = "".join(out).replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _connect(settings: EmailMonitorSettings) -> imaplib.IMAP4:
+    """An authenticated IMAP connection; every operation gives up after ``IMAP_TIMEOUT_SECONDS``."""
+    if settings.imap_use_ssl:
+        conn = imaplib.IMAP4_SSL(settings.imap_host, settings.imap_port, timeout=IMAP_TIMEOUT_SECONDS)
+    else:
+        conn = imaplib.IMAP4(settings.imap_host, settings.imap_port, timeout=IMAP_TIMEOUT_SECONDS)
+    try:
+        if not settings.imap_use_ssl:
+            conn.starttls()
+        conn.login(settings.imap_username, settings.imap_password)
+    except BaseException:
+        _logout(conn)
+        raise
+    return conn
+
+
+def _logout(conn: imaplib.IMAP4) -> None:
+    try:
+        conn.logout()
+    except Exception:
+        pass
+
+
+async def _run_check(lizard: BillTheLizard, settings: EmailMonitorSettings, cat: CheshireCat) -> None:
+    if not settings.imap_username or not settings.imap_password:
+        log.warning("[EmailMonitor] IMAP credentials not configured – skipping.")
+        return
+    stored = await crud_settings.read(_get_db_key(cat)) or {}
+    states = {folder_type: _folder_state(stored.get(folder_type)) for folder_type, _ in FOLDERS}
+    try:
+        conn = _connect(settings)
     except Exception as e:
-        log.error(f"[EmailMonitor] Error accessing folder '{folder}': {e}")
+        log.error(f"[EmailMonitor] IMAP connection failed: {e}")
+        return
+    try:
+        engine = await lizard.ingestion()
+        handlers = await cat.file_handlers()
+        deadline = _clock() + settings.cycle_budget_minutes * 60
+        for folder_type, setting in FOLDERS:
+            if not await _check_folder(conn, cat, engine, settings, handlers, folder_type,
+                                       getattr(settings, setting), states, deadline):
+                break
+    except Exception as e:
+        log.error(f"[EmailMonitor] Mailbox check interrupted: {e}")
+    finally:
+        _logout(conn)
 
-    return documents, new_uids
-
-
-# ---------------------------------------------------------------------------
-# Core monitoring function (called by the scheduler)
-# ---------------------------------------------------------------------------
 
 async def _check_mailbox(settings: EmailMonitorSettings, cat: CheshireCat) -> None:
     """
-    Connect to the IMAP server, fetch new emails from inbox and sent
-    folders, and store them in the Cat's declarative vector memory.
-    This function is invoked periodically by the White Rabbit scheduler.
+    Store the new emails of the inbox and sent folders in the declarative memory of the agent, as files (the body
+    as a text file, the attachments when enabled) ingested by the engine of the core: a change of embedder
+    re-embeds them. Invoked periodically by the White Rabbit; one check at a time per agent (the lock, held until
+    everything is stored).
     """
     lizard = BillTheLizard()
-
-    scheduled_job_id = _get_job_id(cat)
-    lock_acquired = lizard.white_rabbit.acquire_lock(scheduled_job_id)
-    if not lock_acquired:
+    job_id = _get_job_id(cat)
+    if not lizard.white_rabbit.acquire_lock(job_id):
         return
-
     log.info("[EmailMonitor] Starting mailbox check...")
-    if not settings.imap_username or not settings.imap_password:
-        log.warning("[EmailMonitor] IMAP credentials not configured – skipping.")
-        lizard.white_rabbit.release_lock(scheduled_job_id)
-        return
-
-    # load seen UIDs from the database
-    seen = await crud_settings.read(_get_db_key(cat))
-    if not seen:
-        seen = {"inbox": [], "sent": []}
-
-    # open and authenticate an IMAP connection.
     try:
-        if settings.imap_use_ssl:
-            conn = imaplib.IMAP4_SSL(settings.imap_host, settings.imap_port)
-        else:
-            conn = imaplib.IMAP4(settings.imap_host, settings.imap_port)
-            conn.starttls()
-        conn.login(settings.imap_username, settings.imap_password)
-    except Exception as e:
-        log.error(f"[EmailMonitor] IMAP connection failed: {e}")
-        lizard.white_rabbit.release_lock(scheduled_job_id)
-        return
-
-    all_documents: list[Document] = []
-    try:
-        # --- Inbox ---
-        inbox_docs, inbox_new_uids = _fetch_new_emails(
-            conn,
-            settings.inbox_folder,
-            seen.get("inbox", []),
-            "inbox",
-            settings,
-        )
-        all_documents.extend(inbox_docs)
-        seen["inbox"] = list(set(seen.get("inbox", []) + inbox_new_uids))
-
-        # --- Sent ---
-        sent_docs, sent_new_uids = _fetch_new_emails(
-            conn,
-            settings.sent_folder,
-            seen.get("sent", []),
-            "sent",
-            settings,
-        )
-        all_documents.extend(sent_docs)
-        seen["sent"] = list(set(seen.get("sent", []) + sent_new_uids))
+        await _run_check(lizard, settings, cat)
     finally:
-        lizard.white_rabbit.release_lock(scheduled_job_id)
-        try:
-            conn.logout()
-        except Exception:
-            pass
+        lizard.white_rabbit.release_lock(job_id)
 
-    if not all_documents:
-        log.info("[EmailMonitor] No new emails to store.")
-        await _save_seen_uids(cat, seen)
-        lizard.white_rabbit.release_lock(scheduled_job_id)
-        return
 
-    # Store documents in the declarative (vector) memory via the RabbitHole
-    log.info(f"[EmailMonitor] Storing {len(all_documents)} email(s) into declarative memory...")
-    try:
-        # Use the RabbitHole ingestion pipeline to chunk and embed the documents
-        await cat.rabbit_hole.store_documents(
-            docs=all_documents, source=settings.memory_source_tag, file_hash=None, metadata={}
-        )
-        await _save_seen_uids(cat, seen)
-        log.info("[EmailMonitor] Email(s) successfully stored in memory.")
-    except Exception as e:
-        log.error(f"[EmailMonitor] Error storing documents in memory: {e}")
-    finally:
-        lizard.white_rabbit.release_lock(scheduled_job_id)
+@hook(priority=1)
+def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[Document]:
+    """The chunks of an attachment of an email say which email they come from (once: also on a re-embed)."""
+    for doc in docs:
+        metadata = doc.metadata or {}
+        name = metadata.get("email_attachment_filename")
+        if not name:
+            continue
+        header = (f"[ALLEGATO di '{metadata.get('email_subject', '')}' da {metadata.get('email_from', '')}, "
+                  f"{metadata.get('email_date', '')}] {name}\n")
+        if not doc.page_content.startswith(header):
+            doc.page_content = header + doc.page_content
+    return docs
 
 
 async def _setup_email_monitor_schedule(cat: CheshireCat, job_id: str) -> None:
