@@ -19,7 +19,7 @@ from email.message import EmailMessage
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
 
@@ -450,8 +450,15 @@ class Harness:
 
         self.cat.plugin_manager.execute_hook = execute_hook
         # the lizard of the core: its RabbitHole is the ingestion engine (no ``ingestion()`` factory any more)
-        self.lizard = MagicMock(spec=["white_rabbit", "rabbit_hole"], white_rabbit=self.rabbit, rabbit_hole=self.engine)
-        self.cat.lizard = self.lizard
+        self.lizard = MagicMock(spec=["white_rabbit", "rabbit_hole", "get_cheshire_cat"], white_rabbit=self.rabbit,
+                                rabbit_hole=self.engine, get_cheshire_cat=AsyncMock(return_value=self.cat))
+        # the plugin active on the agent, with its settings saved (read by every check, for the agent named)
+        async def load_settings(agent_id):
+            assert agent_id == AGENT, "the settings of the agent checked"
+            return self.settings.model_dump()
+
+        self.cat.mad_hatter.active_plugins = [MODULE.PLUGIN_ID]
+        self.cat.mad_hatter.plugins = {MODULE.PLUGIN_ID: MagicMock(load_settings=load_settings)}
         values = {"imap_username": "u", "imap_password": "p", "inbox_folder": "INBOX", "sent_folder": "Sent",
                   "ingest_attachments": True, "attachment_max_mb": 1, "attachment_max_count": 20,
                   "cycle_budget_minutes": 50}
@@ -480,7 +487,7 @@ class Harness:
                 patch.object(MODULE.imaplib, "IMAP4", self.server.client):
             self.in_check = True
             try:
-                asyncio.run(MODULE._check_mailbox(self.settings, self.cat))
+                asyncio.run(MODULE._check_mailbox(agent_id=AGENT))
             finally:
                 self.in_check = False
 
@@ -1141,7 +1148,7 @@ class TestMailboxEdges(unittest.TestCase):
         async def check_with_heartbeat():
             beat = asyncio.create_task(heartbeat())
             try:
-                await MODULE._check_mailbox(h.settings, h.cat)
+                await MODULE._check_mailbox(agent_id=AGENT)
             finally:
                 beat.cancel()
 

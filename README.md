@@ -19,10 +19,11 @@ Monitors an email mailbox via IMAP and automatically stores every **incoming** (
    every email: an interrupted check (e.g. a restart) resumes where it stopped, without duplicates.
 
 A check holds a lock for its whole duration (one check at a time per agent, also across nodes) and starts no new
-email after **Check Time Budget** minutes (the email it is storing is completed), so a deactivation or a settings
-update, which wait for the running check, wait at most that long. After a crash in the middle of a file, the first
-check after the restart may wait longer: it cleans that file, which the core keeps locked for the dead process until
-its lock expires (`CAT_INGESTION_LOCK_TIMEOUT_SECONDS` after its last renewal, 300 seconds by default).
+email after **Check Time Budget** minutes (the email it is storing is completed). A deactivation or a settings update
+does not wait for a running check: it ends by itself within that budget, and the next one uses the new settings. After
+a crash in the middle of a file, the first check after the restart may wait longer: it cleans that file, which the
+core keeps locked for the dead process until its lock expires (`CAT_INGESTION_LOCK_TIMEOUT_SECONDS` after its last
+renewal, 300 seconds by default).
 
 An email whose storing fails (an attachment the parser cannot read, an email the server does not return) is deleted
 from memory, files and ingestion states included, and tried again at the next check; after 3 failed attempts it is
@@ -217,16 +218,27 @@ The UIDs of the deleted emails stay recorded as processed: they are not ingested
 
 The plugin uses the **White Rabbit** core plugin to schedule periodic mailbox checks:
 
-- When the plugin is activated, a scheduled job is created
-- When settings are updated, the job is recreated with new parameters
+- When the plugin is activated, a scheduled job is created (saved settings that are not valid schedule nothing: the
+  error is logged)
+- When settings are updated (with the plugin active), the job is recreated with the new interval
 - When the plugin is deactivated, the scheduled job is removed
+- At startup, the jobs are created again for the agents with the plugin active (the White Rabbit removes the jobs of a
+  node when it shuts down), and removed for the others
+- When the agent is destroyed, the job is removed and then the state of its folders (UIDVALIDITY, UIDs done,
+  attempts), once the running check has ended (at most 5 minutes later): an agent created again with the same id reads
+  its mailbox from the start
 - The job runs every N minutes (configurable via `poll_interval_minutes`)
+
+The White Rabbit keeps its jobs in Redis, shared by the nodes: the job holds only the id of the agent, and every check
+reads the agent and its settings of that moment (it does nothing if the plugin is not active on the agent, e.g.
+deactivated for the whole instance).
 
 ---
 
 ## Security
 
-- The IMAP password is stored in the plugin's settings (managed by the Cat), encrypted at rest. Using a dedicated **App Password** is strongly recommended.
+- The IMAP password is stored in the plugin's settings (managed by the Cat), encrypted at rest; it is not stored in
+  the scheduled job, which holds only the id of the agent. Using a dedicated **App Password** is strongly recommended.
 - The plugin connects in **read-only mode** (`readonly=True`) to all IMAP folders: it never modifies, moves, or deletes any email.
 - The state of the folders (UIDVALIDITY, UIDs done, failed attempts) is stored in the database using the Cat's CRUD
   settings system.

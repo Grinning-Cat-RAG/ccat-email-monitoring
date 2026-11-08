@@ -27,19 +27,24 @@ from typing import Dict, List, Any, Tuple
 
 from langchain_core.documents import Document
 
-from cat.core_plugins.white_rabbit.white_rabbit import JobStatus
 from cat.log import log
 from cat import hook, CheshireCat, BillTheLizard
 from cat.db.cruds import ingestions as crud_ingestions
 from cat.rabbit_hole.engine import STATE_COMPLETE
 from cat.rabbit_hole.phases import PHASE_EMBEDDING
 from cat.db.cruds.settings import crud as crud_settings
+from cat.db.cruds import plugins as crud_plugins, settings as crud_agents
 from cat.utils import guess_file_type
 from .settings import EmailMonitorSettings
 
 
-# while the mailbox check of the agent runs, its replacement checks it again after this many seconds
+# the id of the plugin: the name of its folder, as for the core
+PLUGIN_ID = os.path.basename(os.path.dirname(os.path.abspath(__file__)))
+# the destroy of an agent waits for its running check (its lock) checking it again after this many seconds, at most
+# DESTROY_WAIT_SECONDS: a check of a destroyed agent ends at its next file (the core cancels its ingestions), and the
+# lock of a check whose node died stays until it expires (an hour)
 JOB_POLL_SECONDS = 5
+DESTROY_WAIT_SECONDS = 300
 # an email that fails this many times is not tried again (its failed attachments, or the whole email, are given up)
 MAX_ATTEMPTS = 3
 # every operation on the IMAP server (connection included) gives up after this many seconds; imaplib is blocking:
@@ -59,19 +64,21 @@ def _clock() -> float:
     return time.monotonic()
 
 
-def _get_job_id(cat: CheshireCat) -> str:
-    return f"ccat_email_monitoring:{cat.agent_key}"
+def _get_job_id(agent_id: str) -> str:
+    return f"ccat_email_monitoring:{agent_id}"
 
 
-def _get_db_key(cat: CheshireCat) -> str:
-    return f"plugins:{_get_job_id(cat)}:seen"
+def _get_db_key(agent_id: str) -> str:
+    """The state of the folders of the agent; out of the keys of the agent the core destroys with it (see
+    ``after_cheshire_cat_destroy``)."""
+    return f"plugins:{_get_job_id(agent_id)}:seen"
 
 
 async def _save_state(cat: CheshireCat, state: Dict[str, Any]) -> None:
     """Persist the state of the folders. A failure is logged: the next check does again what it lost (every email
     is cleaned before being stored)."""
     try:
-        await crud_settings.store(_get_db_key(cat), state)
+        await crud_settings.store(_get_db_key(cat.agent_key), state)
     except Exception as e:
         log.error(f"[EmailMonitor] Error saving the state of the mailbox: {e}")
 
@@ -870,7 +877,7 @@ async def _run_check(lizard: BillTheLizard, settings: EmailMonitorSettings, cat:
     if not settings.imap_username or not settings.imap_password:
         log.warning("[EmailMonitor] IMAP credentials not configured – skipping.")
         return
-    stored = await crud_settings.read(_get_db_key(cat)) or {}
+    stored = await crud_settings.read(_get_db_key(cat.agent_key)) or {}
     states = {folder_type: _folder_state(stored.get(folder_type)) for folder_type, _ in FOLDERS}
     try:
         conn = await asyncio.to_thread(_connect, settings)
@@ -891,19 +898,31 @@ async def _run_check(lizard: BillTheLizard, settings: EmailMonitorSettings, cat:
         await asyncio.to_thread(_logout, conn)
 
 
-async def _check_mailbox(settings: EmailMonitorSettings, cat: CheshireCat) -> None:
+async def _check_mailbox(agent_id: str) -> None:
     """
     Store the new emails of the inbox and sent folders in the declarative memory of the agent, as files (the body
     as a text file, the attachments when enabled) ingested by the RabbitHole of the core: a change of embedder
     re-embeds them. Invoked periodically by the White Rabbit; one check at a time per agent (the lock, held until
     everything is stored).
+
+    The White Rabbit keeps its jobs in Redis, pickled, across restarts and nodes: the job holds only the id of the
+    agent (an agent is not serializable, and the settings would put the password in clear in Redis). Every check
+    gets the agent and its settings of that moment (the settings of the agent named: the core would guess it from the
+    stack); nothing is done when the agent has no cat or the plugin is not active on it (e.g. deactivated for the whole
+    instance, which removes no job: a later activation on the agent keeps it).
     """
     lizard = BillTheLizard()
-    job_id = _get_job_id(cat)
+    job_id = _get_job_id(agent_id)
     if not lizard.white_rabbit.acquire_lock(job_id):
         return
-    log.info("[EmailMonitor] Starting mailbox check...")
     try:
+        cat = await lizard.get_cheshire_cat(agent_id)
+        if cat is None:
+            return
+        if PLUGIN_ID not in cat.mad_hatter.active_plugins:
+            return
+        settings = EmailMonitorSettings(**await cat.mad_hatter.plugins[PLUGIN_ID].load_settings(agent_id))
+        log.info("[EmailMonitor] Starting mailbox check...")
         await _run_check(lizard, settings, cat)
     finally:
         lizard.white_rabbit.release_lock(job_id)
@@ -924,86 +943,87 @@ def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[Docume
     return docs
 
 
-async def _setup_email_monitor_schedule(cat: CheshireCat, job_id: str) -> None:
-    """Setup or update the White Rabbit scheduled job for EmailMonitoring."""
-    raw_settings = await cat.mad_hatter.get_plugin().load_settings()
+def _schedule(agent_id: str, settings: Dict[str, Any] | None) -> None:
+    """Schedule the periodic check of the agent every **Poll Interval** minutes of ``settings``, unless it is scheduled
+    already (by another node, or before). The job holds only the id of the agent (see ``_check_mailbox``). Settings
+    that are not valid schedule nothing: the error is logged."""
     try:
-        settings = EmailMonitorSettings(**raw_settings)
-        interval_minutes = settings.poll_interval_minutes
-        # If no command is configured, just remove the job and return
-        if not interval_minutes:
-            log.debug("No scheduled EmailMonitor interval configured, skipping job setup")
+        interval_minutes = EmailMonitorSettings(**(settings or {})).poll_interval_minutes
+        white_rabbit = BillTheLizard().white_rabbit
+        if white_rabbit.get_job(_get_job_id(agent_id)):
             return
-
-        log.info(f"EmailMonitor Plugin activated. Scheduling mailbox check every {interval_minutes} minute(s).")
-
-        lizard = cat.lizard
-
-        # Avoid adding the same job twice
-        if lizard.white_rabbit.get_job(job_id):
-            log.debug(f"EmailMonitor job '{job_id}' already scheduled for CheshireCat '{cat.agent_key}'")
-            return
-
-        lizard.white_rabbit.schedule_interval_job(
-            job=_check_mailbox,
-            job_id=job_id,
-            minutes=interval_minutes,
-            settings=settings,
-            cat=cat,
+        white_rabbit.schedule_interval_job(
+            job=_check_mailbox, job_id=_get_job_id(agent_id), minutes=interval_minutes, agent_id=agent_id,
         )
-
-        log.info(f"EmailMonitor scheduled every {interval_minutes} minute(s) for CheshireCat '{cat.agent_key}'")
+        log.info(f"[EmailMonitor] Mailbox check of agent {agent_id} scheduled every {interval_minutes} minute(s)")
     except Exception as e:
-        log.error(f"Failed to setup scheduled EmailMonitor job: {str(e)}")
+        log.error(f"[EmailMonitor] Unable to schedule the mailbox check of agent {agent_id}: {e}")
 
 
-async def _remove_email_monitor_schedule(job_id: str) -> None:
-    log.info("EmailMonitor Plugin: removing scheduled job.")
-    lizard = BillTheLizard()
+def _unschedule(agent_id: str) -> None:
+    """Remove the job of the agent. A running check is not stopped: it ends by itself (within the **Check Time
+    Budget**), and its lock keeps the checks of the agent one at a time."""
+    white_rabbit = BillTheLizard().white_rabbit
+    if white_rabbit.get_job(_get_job_id(agent_id)):
+        white_rabbit.remove_job(_get_job_id(agent_id))
 
-    # Wait for any currently running execution to finish before replacing the job
-    while True:
-        job = lizard.white_rabbit.get_job(job_id)
 
-        if not job:
-            return  # No job exists, nothing to remove
-
-        if job.status != JobStatus.RUNNING:
-            lizard.white_rabbit.remove_job(job_id)
-            return
-
-        log.debug(f"EmailMonitor job '{job_id}' is still running, waiting before replacing...")
-        # asynchronous: the event loop serves the other requests while the check runs
-        await asyncio.sleep(JOB_POLL_SECONDS)
+@hook(priority=0)
+async def after_lizard_bootstrap(lizard) -> None:
+    """At startup, align the jobs with the agents having the plugin active: the White Rabbit removes the jobs a node
+    scheduled when that node shuts down (it is created by its own ``after_lizard_bootstrap``, with a higher priority).
+    The failure of an agent does not stop the others."""
+    if getattr(lizard, "white_rabbit", None) is None:
+        return
+    for agent_id in await crud_agents.get_agents_main_keys():
+        try:
+            if PLUGIN_ID in (await crud_plugins.get_active_plugins_from_db(agent_id) or []):
+                _schedule(agent_id, await lizard.plugin_manager.plugins[PLUGIN_ID].load_settings(agent_id))
+            else:
+                _unschedule(agent_id)
+        except Exception as e:
+            log.error(f"[EmailMonitor] Unable to align the mailbox check of agent {agent_id}: {e}")
 
 
 @hook(priority=1)
 async def after_plugin_toggling_on_agent(plugin_id: str, cat: CheshireCat) -> None:
-    """
-    Schedule the periodic mailbox check when the plugin is activated.
-    """
-    if plugin_id != cat.mad_hatter.get_plugin().id:
+    """Schedule the periodic mailbox check when the plugin is activated on the agent, remove it when deactivated."""
+    if plugin_id != PLUGIN_ID:
         return
-
-    job_id = _get_job_id(cat)
-
     if plugin_id in cat.mad_hatter.active_plugins:
-        await _setup_email_monitor_schedule(cat, job_id)
-        return
-
-    await _remove_email_monitor_schedule(job_id)
+        _schedule(cat.agent_key, await cat.mad_hatter.plugins[PLUGIN_ID].load_settings(cat.agent_key))
+    else:
+        _unschedule(cat.agent_key)
 
 
 @hook(priority=0)
 async def after_plugin_settings_update(plugin_id: str, settings: Dict[str, Any], cat: CheshireCat) -> None:
-    """Hook called when plugin settings are updated — replaces the cron job with the new config."""
-    if plugin_id != cat.mad_hatter.get_plugin().id:
+    """The settings saved: the job is scheduled again with their interval (every check reads the settings of its
+    moment). Nothing when the plugin is not active on the agent."""
+    if plugin_id != PLUGIN_ID or plugin_id not in cat.mad_hatter.active_plugins:
         return
+    _unschedule(cat.agent_key)
+    _schedule(cat.agent_key, settings)
 
-    job_id = _get_job_id(cat)
 
-    # Remove the existing job
-    await _remove_email_monitor_schedule(job_id)
-
-    # Schedule a fresh job with the updated settings
-    await _setup_email_monitor_schedule(cat, job_id)
+@hook(priority=0)
+async def after_cheshire_cat_destroy(agent_id: str, cat: CheshireCat) -> None:
+    """The agent is destroyed: its check is not scheduled anymore, and the state of its folders, out of the keys the
+    core destroys, goes too (an agent created again with the same id would skip the emails it remembers). The state
+    goes once a running check, which saves it, has ended: its lock is free (on any node), or after
+    DESTROY_WAIT_SECONDS (logged)."""
+    _unschedule(agent_id)
+    white_rabbit = BillTheLizard().white_rabbit
+    job_id = _get_job_id(agent_id)
+    waited = 0.0
+    while not (locked := white_rabbit.acquire_lock(job_id)) and waited < DESTROY_WAIT_SECONDS:
+        await asyncio.sleep(JOB_POLL_SECONDS)  # asynchronous: the instance keeps serving the other requests
+        waited += JOB_POLL_SECONDS
+    try:
+        if not locked:
+            log.warning(f"[EmailMonitor] agent {agent_id}: its check still runs after {DESTROY_WAIT_SECONDS}s, "
+                        "the state of its folders is deleted anyway")
+        await crud_settings.delete(_get_db_key(agent_id))
+    finally:
+        if locked:
+            white_rabbit.release_lock(job_id)
