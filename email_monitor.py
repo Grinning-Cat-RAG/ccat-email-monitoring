@@ -30,6 +30,7 @@ from langchain_core.documents import Document
 from cat.log import log
 from cat import hook, CheshireCat, BillTheLizard
 from cat.db.cruds import ingestions as crud_ingestions
+from cat.exceptions import UnknownAgentException
 from cat.rabbit_hole.engine import STATE_COMPLETE
 from cat.rabbit_hole.phases import PHASE_EMBEDDING
 from cat.db.cruds.settings import crud as crud_settings
@@ -908,18 +909,28 @@ async def _check_mailbox(agent_id: str) -> None:
     The White Rabbit keeps its jobs in Redis, pickled, across restarts and nodes: the job holds only the id of the
     agent (an agent is not serializable, and the settings would put the password in clear in Redis). Every check
     gets the agent and its settings of that moment (the settings of the agent named: the core would guess it from the
-    stack); nothing is done when the agent has no cat or the plugin is not active on it (e.g. deactivated for the whole
-    instance, which removes no job: a later activation on the agent keeps it).
+    stack). The job ends itself when the plugin is not active on the agent or the agent is gone: no hook of the plugin
+    runs when it is deactivated for the whole instance (the core clears it from the agents) or when the agent is
+    destroyed while the plugin is not active on it, and the jobs outlive the restarts. A later activation on the agent
+    schedules it again.
     """
     lizard = BillTheLizard()
     job_id = _get_job_id(agent_id)
     if not lizard.white_rabbit.acquire_lock(job_id):
         return
     try:
-        cat = await lizard.get_cheshire_cat(agent_id)
+        try:
+            cat = await lizard.get_cheshire_cat(agent_id)
+        except UnknownAgentException:
+            # destroyed with the plugin not active on it (no destroy hook): the state of its folders goes too, as in
+            # ``after_cheshire_cat_destroy`` (the lock is held); first the state, so a failure is retried at the next run
+            await crud_settings.delete(_get_db_key(agent_id))
+            _unschedule(agent_id)
+            return
         if cat is None:
             return
         if PLUGIN_ID not in cat.mad_hatter.active_plugins:
+            _unschedule(agent_id)
             return
         settings = EmailMonitorSettings(**await cat.mad_hatter.plugins[PLUGIN_ID].load_settings(agent_id))
         log.info("[EmailMonitor] Starting mailbox check...")
@@ -945,7 +956,8 @@ def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[Docume
 
 def _schedule(agent_id: str, settings: Dict[str, Any] | None) -> None:
     """Schedule the periodic check of the agent every **Poll Interval** minutes of ``settings``, unless it is scheduled
-    already (by another node, or before). The job holds only the id of the agent (see ``_check_mailbox``). Settings
+    already (the startup of every node: its next run is kept). An activation or a settings update removes the job
+    first, so its interval is the one saved. The job holds only the id of the agent (see ``_check_mailbox``). Settings
     that are not valid schedule nothing: the error is logged."""
     try:
         interval_minutes = EmailMonitorSettings(**(settings or {})).poll_interval_minutes
@@ -970,9 +982,11 @@ def _unschedule(agent_id: str) -> None:
 
 @hook(priority=0)
 async def after_lizard_bootstrap(lizard) -> None:
-    """At startup, align the jobs with the agents having the plugin active: the White Rabbit removes the jobs a node
-    scheduled when that node shuts down (it is created by its own ``after_lizard_bootstrap``, with a higher priority).
-    The failure of an agent does not stop the others."""
+    """At startup, align the jobs with the agents having the plugin active: a job is created where it misses (e.g. the
+    first startup after the upgrade: the previous versions left no job in the store) and removed where the plugin is
+    not active. The jobs outlive the restarts (the White Rabbit keeps them in its store until removed). The White
+    Rabbit is created by its own ``after_lizard_bootstrap``, with a higher priority. The failure of an agent does not
+    stop the others."""
     if getattr(lizard, "white_rabbit", None) is None:
         return
     for agent_id in await crud_agents.get_agents_main_keys():
@@ -990,10 +1004,9 @@ async def after_plugin_toggling_on_agent(plugin_id: str, cat: CheshireCat) -> No
     """Schedule the periodic mailbox check when the plugin is activated on the agent, remove it when deactivated."""
     if plugin_id != PLUGIN_ID:
         return
+    _unschedule(cat.agent_key)  # also a job left while the plugin was off for the whole instance (no hook ended it)
     if plugin_id in cat.mad_hatter.active_plugins:
         _schedule(cat.agent_key, await cat.mad_hatter.plugins[PLUGIN_ID].load_settings(cat.agent_key))
-    else:
-        _unschedule(cat.agent_key)
 
 
 @hook(priority=0)

@@ -222,16 +222,18 @@ The plugin uses the **White Rabbit** core plugin to schedule periodic mailbox ch
   error is logged)
 - When settings are updated (with the plugin active), the job is recreated with the new interval
 - When the plugin is deactivated, the scheduled job is removed
-- At startup, the jobs are created again for the agents with the plugin active (the White Rabbit removes the jobs of a
-  node when it shuts down), and removed for the others
-- When the agent is destroyed, the job is removed and then the state of its folders (UIDVALIDITY, UIDs done,
-  attempts), once the running check has ended (at most 5 minutes later): an agent created again with the same id reads
-  its mailbox from the start
+- At startup, the jobs are aligned with the agents: created for the agents with the plugin active that have none (e.g.
+  the first startup after the upgrade: the previous versions left no job in the store), removed for the others. The
+  jobs outlive the restarts of the nodes: the White Rabbit keeps them in Redis until they are removed
+- When the plugin is deactivated for the whole instance, or an agent is destroyed while the plugin is not active on it
+  (no hook of the plugin runs), the job of the agent removes itself at its next run
+- When the agent is destroyed with the plugin active on it, the job is removed and then the state of its folders
+  (UIDVALIDITY, UIDs done, attempts), once the running check has ended (at most 5 minutes later): an agent created
+  again with the same id reads its mailbox from the start
 - The job runs every N minutes (configurable via `poll_interval_minutes`)
 
 The White Rabbit keeps its jobs in Redis, shared by the nodes: the job holds only the id of the agent, and every check
-reads the agent and its settings of that moment (it does nothing if the plugin is not active on the agent, e.g.
-deactivated for the whole instance).
+reads the agent and its settings of that moment.
 
 ---
 
