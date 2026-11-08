@@ -2,7 +2,8 @@
 as a .txt, its attachments when enabled) through the RabbitHole of the core, so that a change of embedder
 re-embeds them; per-email attempts, cleanup, UIDVALIDITY, time budget, lock.
 
-Run from the core root: ``python -m pytest cat/plugins/ccat-email-monitoring/tests``.
+Run from the core root, with the secrets the core requires (any value for the tests):
+``CAT_CRYPTO_KEY=test CAT_CRYPTO_SALT=test python -m pytest cat/plugins/ccat-email-monitoring/tests``.
 
 The Cat imports every ``.py`` file of the plugin, tests included: at import time this module needs only the stdlib,
 the Cat, the plugin and hypothesis are loaded in ``setUpClass`` and in the tests.
@@ -188,11 +189,16 @@ class VectorDB:
 
     async def delete_tenant_points(self, collection_name, metadata=None):
         assert collection_name == "declarative"
+        if self.down:
+            raise RuntimeError("vector db unreachable")
         self.points = [p for p in self.points if not self._matches(p, metadata)]
 
     def add(self, page_content, metadata):
         self.next_id += 1
         self.points.append({"id": self.next_id, "payload": {"page_content": page_content, "metadata": metadata}})
+
+    def delete_source(self, source):
+        self.points = [p for p in self.points if p["payload"]["metadata"]["source"] != source]
 
     def sources(self):
         return [p["payload"]["metadata"]["source"] for p in self.points]
@@ -214,22 +220,33 @@ class FileManager:
 
 
 class Engine:
-    """The RabbitHole of the core (``lizard.rabbit_hole``), synchronous: stores the file first, then parses, embeds and stores the
-    points (one per file here), firing ``before_rabbithole_stores_documents``. It swallows its own errors, as the
-    core does; faults: "zero" (no points: the file cannot be parsed, the embedder is down), "crash" (the container
-    restarts)."""
+    """The RabbitHole of the core (``lizard.rabbit_hole``), synchronous, with its registry of the ingestion states
+    (``crud_ingestions``). An ingestion creates the row of the source, keeps its file, then runs its phases: the
+    parsing (the chunks, with ``before_rabbithole_stores_documents`` applied, kept in the storage) and the embedding (the
+    points of the source replaced by the new ones, one per file here). It swallows its errors and returns the final
+    row, as the core does. Faults of an ingestion: "crash_early" (the container restarts with the row only),
+    "crash" (the file kept, not parsed), "crash_late" (the chunks kept, not embedded), "unreadable" (the parsing
+    fails), "zero" (the embedding fails: the embedder is down; the chunks stay), "raises" (its database, Redis, is
+    down: the error is raised), "canceled" (None: the agent was deleted meanwhile), "other_phase" (a phase another
+    plugin adds fails after the embedding: the points stay, the state is in error). ``delete_fails`` makes the next
+    deletion fail after its ``before`` (the vector DB down): the row stays ``deleting``, the uploaded file is gone."""
+
+    IN_FLIGHT = ("uploaded", "processing", "deleting")
 
     def __init__(self, harness):
         self.harness = harness
         self.faults = {}  # source -> list of faults, consumed one per ingestion ("ok" passes)
         self.queue = []  # faults of the next ingestions, whatever their file
         self.broken = {}  # source -> fault of every ingestion of it
-        self.break_next = None  # the next file ingested gets broken with this fault
+        self.break_next = None  # the next attachment ingested gets broken with this fault
         self.calls = []  # (source, clock at the start)
+        self.rows = {}  # source -> row of the registry (the knowledge base of the agent)
+        self.chunks = {}  # source -> the kept chunks (``.rabbithole``)
+        self.delete_fails = False
+        self.raised = False  # an error was raised to the plugin (Redis or the vector DB down)
 
+    # -- the RabbitHole --
     async def ingest_file(self, cat, file, metadata, filename=None, store_file=True, content_type=None):
-        from langchain_core.documents import Document
-
         h = self.harness
         source = _sanitize(filename)
         self.calls.append((source, h.clock))
@@ -237,22 +254,141 @@ class Engine:
             h.check_lock_held()
         data = file.read()
         h.clock += SECONDS_PER_FILE
-        if store_file:
-            h.files.files[os.path.join(AGENT, source)] = data
+        # a new upload starts the lifecycle of the source again
+        self.rows[source] = {
+            "source": source,
+            "chat_id": None,
+            "status": "uploaded",
+            "metadata": dict(metadata or {}),
+            "content_type": content_type,
+            "completed_phases": {},
+            "error": None,
+        }
         if self.break_next is not None and "email_attachment_filename" in (metadata or {}):
             self.broken[source], self.break_next = self.break_next, None
         faults = self.faults.get(source) or []
         fault = faults.pop(0) if faults else self.queue.pop(0) if self.queue else self.broken.get(source, "ok")
+        if fault == "crash_early":
+            raise Crash()
+        if store_file:
+            h.files.files[os.path.join(AGENT, source)] = data
+        self.rows[source]["status"] = "processing"
         if fault == "crash":
             raise Crash()
-        if fault == "zero" or content_type not in h.handlers:
+        if fault == "raises":
+            self.raised = True
+            raise ConnectionError("redis unreachable")
+        if fault == "canceled":  # what the phases produced is removed with the row; the uploaded file stays
+            self._remove(source)
             return None
-        text = data.decode("utf-8") if content_type == "text/plain" else f"<{content_type} {source}>"
-        docs = [Document(page_content=text, metadata=dict(metadata or {}) | {"source": source, "when": h.clock})]
-        docs = HOOKS["before_rabbithole_stores_documents"](docs, cat)
-        for doc in docs:
-            h.db.add(doc.page_content, doc.metadata)
-        return None
+        self._run_phases(cat, source, data, fault)
+        return copy.deepcopy(self.rows[source])
+
+    def _run_phases(self, cat, source, data, fault="ok"):
+        from langchain_core.documents import Document
+
+        h, row = self.harness, self.rows[source]
+        if self._state(row, "parsing_chunking") != "complete":
+            if data is None:
+                return self._fail(source, "parsing_chunking", "the source was not kept")
+            if fault == "unreadable" or row["content_type"] not in h.handlers:
+                return self._fail(source, "parsing_chunking", "no valid chunks")
+            text = data.decode("utf-8") if row["content_type"] == "text/plain" else f"<{row['content_type']} {source}>"
+            docs = [Document(page_content=text, metadata=dict(row["metadata"]) | {"source": source, "when": h.clock})]
+            self.chunks[source] = HOOKS["before_rabbithole_stores_documents"](docs, cat)
+            row["completed_phases"]["parsing_chunking"] = {"state": "complete"}
+            row["completed_phases"].pop("embedding", None)
+            if fault == "crash_late":
+                raise Crash()
+        if fault == "zero":
+            return self._fail(source, "embedding", "the embedder is down")
+        h.db.delete_source(source)  # the points of the source replaced by the new ones
+        for doc in self.chunks[source]:
+            h.db.add(doc.page_content, dict(doc.metadata))
+        row["completed_phases"]["embedding"] = {"state": "complete", "processed": len(self.chunks[source])}
+        if fault == "other_phase":
+            return self._fail(source, "other_plugin_phase", "a phase of another plugin failed")
+        row["completed_phases"]["other_plugin_phase"] = {"state": "complete"}
+        row.update(status="completed", error=None)
+
+    @staticmethod
+    def _state(row, phase):
+        return (row["completed_phases"].get(phase) or {}).get("state")
+
+    def _fail(self, source, phase, reason):
+        self.rows[source]["completed_phases"][phase] = {"state": "error", "reason": reason}
+        self.rows[source].update(status="error", error=reason)
+
+    async def delete_source(self, cat, name, chat_id=None, wait=None, before=None):
+        """Waits for a worker of the source (none here: synchronous), runs ``before``, then removes what the phases
+        produced (the points, the chunks) and the row; the uploaded file is left to ``before``."""
+        h = self.harness
+        if h.in_check:
+            h.check_lock_held()
+        result = await before() if before is not None else None
+        if name in self.rows:
+            self.rows[name]["status"] = "deleting"
+        if self.delete_fails:
+            self.delete_fails, self.raised = False, True
+            raise RuntimeError("vector db unreachable")
+        await h.db.delete_tenant_points("declarative", {"source": name})
+        self._remove(name)
+        return result
+
+    def _remove(self, source):
+        self.harness.db.delete_source(source)
+        self.chunks.pop(source, None)
+        self.rows.pop(source, None)
+
+    # -- the registry (``cat.db.cruds.ingestions``) --
+    async def get_status(self, agent_id, chat_id, source):
+        assert (agent_id, chat_id) == (AGENT, None), "the knowledge base of the agent"
+        return copy.deepcopy(self.rows.get(source))
+
+    async def list_statuses(self, agent_id, chat_id=None):
+        assert (agent_id, chat_id) == (AGENT, None), "the knowledge base of the agent"
+        return [copy.deepcopy(row) for row in self.rows.values()]
+
+    # -- the core, outside the plugin --
+    def resume(self):
+        """The automatic resume: the sources in flight (their worker died) run their phases again from what was
+        kept; an interrupted deletion is completed."""
+        for source, row in list(self.rows.items()):
+            if row["status"] in self.IN_FLIGHT:
+                self._rerun(source)
+
+    def _rerun(self, source):
+        """``RabbitHole.rerun_source``: a deletion completed, else the phases not done run (a failed parsing stays)."""
+        row = self.rows[source]
+        if row["status"] == "deleting":
+            return self._remove(source)
+        if self._state(row, "parsing_chunking") == "error":
+            return None
+        row["status"] = "processing"
+        return self._run_phases(self.harness.cat, source, self.harness.files.read_file(source, AGENT))
+
+    def change_embedder(self):
+        """A change of the embedder: the collections recreated (every point dropped); the sources without a state
+        ingested again from their file (``embed_stored_sources``), then every source with a state embedded again from
+        its chunks, and the phases it misses, whatever its status (``rerun_source(invalidate=["embedding"])``)."""
+        from cat.utils import guess_file_type
+
+        h = self.harness
+        legacy = {}
+        for point in h.db.points:
+            meta = point["payload"]["metadata"]
+            if meta["source"] not in self.rows:
+                legacy.setdefault(meta["source"], meta)
+        h.db.points = []
+        for source, metadata in legacy.items():
+            content = h.files.read_file(source, AGENT)
+            if content:
+                content_type, _ = guess_file_type(BytesIO(content))
+                asyncio.run(self.ingest_file(h.cat, BytesIO(content), metadata, filename=source, store_file=False,
+                                             content_type=content_type))
+        for source, row in list(self.rows.items()):
+            row["completed_phases"].pop("embedding", None)  # invalidated: it runs again, with what it depends on
+            self._rerun(source)
 
 
 class Crud:
@@ -307,6 +443,12 @@ class Harness:
             return dict(self.handlers)
 
         self.cat.file_handlers = file_handlers
+        self.hooks = []  # (hook, *args) fired by the plugin
+
+        async def execute_hook(name, *args, caller=None):
+            self.hooks.append((name, *args))
+
+        self.cat.plugin_manager.execute_hook = execute_hook
         # the lizard of the core: its RabbitHole is the ingestion engine (no ``ingestion()`` factory any more)
         self.lizard = MagicMock(spec=["white_rabbit", "rabbit_hole"], white_rabbit=self.rabbit, rabbit_hole=self.engine)
         self.cat.lizard = self.lizard
@@ -332,6 +474,7 @@ class Harness:
     def cycle(self):
         with patch.object(MODULE, "BillTheLizard", return_value=self.lizard), \
                 patch.object(MODULE, "crud_settings", self.crud), \
+                patch.object(MODULE, "crud_ingestions", self.engine), \
                 patch.object(MODULE, "_clock", lambda: self.clock), \
                 patch.object(MODULE.imaplib, "IMAP4_SSL", self.server.client), \
                 patch.object(MODULE.imaplib, "IMAP4", self.server.client):
@@ -342,21 +485,12 @@ class Harness:
                 self.in_check = False
 
     def reembed(self):
-        """The re-embed of the core on a change of embedder: every point dropped, every stored file ingested again
-        with the metadata of one of its points (``embed_stored_sources``)."""
-        from cat.utils import guess_file_type
+        """A change of the embedder (see ``Engine.change_embedder``)."""
+        self.engine.change_embedder()
 
-        by_source = {}
-        for point in self.db.points:
-            by_source.setdefault(point["payload"]["metadata"]["source"], point["payload"]["metadata"])
-        self.db.points = []
-        for source, metadata in by_source.items():
-            content = self.files.read_file(source, AGENT)
-            if not content:
-                continue
-            content_type, _ = guess_file_type(BytesIO(content))
-            asyncio.run(self.engine.ingest_file(self.cat, BytesIO(content), filename=source, metadata=metadata,
-                                                store_file=False, content_type=content_type))
+    def resume(self):
+        """A pass of the automatic resume of the core (see ``Engine.resume``)."""
+        self.engine.resume()
 
     def points_of(self, folder, uid, **more):
         meta = {"email_folder": folder, "email_uid": str(uid)} | more
@@ -455,7 +589,8 @@ class TestMailboxCycle(unittest.TestCase):
     def test_attachments_are_stored_with_the_email_metadata_and_a_header(self):
         h = Harness()
         uid = h.server.folders["Sent"].append(build_email(
-            subject="Preventivo", attachments=[attachment("pdf", "Fattura è 2024.PDF"), attachment("txt", "n.txt")]))
+            subject="Preventivo", attachments=[attachment("pdf", "Fattura è 2024.PDF"), attachment("txt", "n.txt")]
+        ))
         h.cycle()
         base = f"email_monitor_sent_7_{uid}"
         self.assertEqual(sorted(h.db.sources()),
@@ -465,7 +600,8 @@ class TestMailboxCycle(unittest.TestCase):
         self.assertEqual(pdf["metadata"]["email_attachment_mime"], "application/pdf")
         self.assertEqual(pdf["metadata"]["email_direction"], "SENT")
         self.assertTrue(pdf["page_content"].startswith(
-            "[ALLEGATO di 'Preventivo' da a@b.it, 2026-11-03T10:00:00+01:00] Fattura è 2024.PDF\n"))
+            "[ALLEGATO di 'Preventivo' da a@b.it, 2026-11-03T10:00:00+01:00] Fattura è 2024.PDF\n")
+        )
         body = h.points_of("sent", uid, source=f"{base}.txt")[0]["metadata"]
         self.assertEqual(body["email_attachments_ingested"], ["Fattura è 2024.PDF", "n.txt"])
         self.assertNotIn("email_attachment_filename", body)
@@ -535,8 +671,10 @@ class TestMailboxCycle(unittest.TestCase):
         body = Document(page_content="corpo", metadata={"email_uid": "1"})
         hook = HOOKS["before_rabbithole_stores_documents"]
         first = hook([doc, other, body], MagicMock())
-        self.assertEqual([d.page_content for d in first],
-                         ["[ALLEGATO di 'S' da f, d] a.pdf\ncontenuto", "altro", "corpo"])
+        self.assertEqual(
+            [d.page_content for d in first],
+            ["[ALLEGATO di 'S' da f, d] a.pdf\ncontenuto", "altro", "corpo"],
+        )
         again = hook(first, MagicMock())
         self.assertEqual(again[0].page_content, "[ALLEGATO di 'S' da f, d] a.pdf\ncontenuto")
 
@@ -675,8 +813,10 @@ class TestMailboxCycle(unittest.TestCase):
         self.assertEqual(len(h.db.points), 1, "the first attachment, stored before the crash")
         h.rabbit.locks.clear()  # the TTL of the lock of the dead process expires
         h.cycle()
-        self.assertEqual(sorted(h.db.sources()), sorted(f"email_monitor_inbox_1_{uid}{s}" for s in (
-            ".txt", "_1_a.pdf", "_2_b.pdf")))
+        self.assertEqual(
+            sorted(h.db.sources()),
+            sorted(f"email_monitor_inbox_1_{uid}{s}" for s in (".txt", "_1_a.pdf", "_2_b.pdf")),
+        )
         self.assertEqual(sorted(h.files.files), sorted(f"{AGENT}/{s}" for s in h.db.sources()))
 
     def test_a_crash_then_attachments_turned_off_leaves_no_file(self):
@@ -803,6 +943,101 @@ class TestMailboxCycle(unittest.TestCase):
         after = sorted((p["payload"]["metadata"]["source"], p["payload"]["page_content"]) for p in h.db.points)
         self.assertEqual(after, before)
 
+    def assert_only_the_stored_files(self, h, sources):
+        """Of the ingestion of the core, only the files of ``sources`` are left (completed): no state, chunk, file or
+        point of anything the plugin deleted, that the automatic resume or a change of embedder would bring back."""
+        sources = sorted(sources)
+        self.assertEqual(sorted(h.db.sources()), sources, "points")
+        self.assertEqual(sorted(h.files.files), [f"{AGENT}/{s}" for s in sources], "files")
+        self.assertEqual(sorted(h.engine.rows), sources, "ingestion states")
+        self.assertEqual(sorted(h.engine.chunks), sources, "kept chunks")
+        self.assertEqual({r["status"] for r in h.engine.rows.values()}, {"completed"} if sources else set())
+
+    def test_a_phase_of_another_plugin_failing_does_not_block_the_mailbox(self):
+        """The file has its points (its embedding completed): it is stored, as for the core, which notifies its points;
+        the error stays in its ingestion state, for the core to show and to run again with a change of embedder."""
+        h = Harness()
+        uid = h.server.folders["INBOX"].append(build_email(attachments=[attachment("pdf", "a.pdf")]))
+        base = f"email_monitor_inbox_1_{uid}"
+        h.engine.faults[f"{base}.txt"] = ["other_phase"]
+        h.engine.faults[f"{base}_1_a.pdf"] = ["other_phase"]
+        h.cycle()
+        h.cycle()
+        self.assertEqual(sorted(h.db.sources()), [f"{base}.txt", f"{base}_1_a.pdf"])
+        self.assertEqual(len(h.engine.calls), 2, "stored once, not tried again")
+        self.assertEqual(h.state()["inbox"], {"uidvalidity": "1", "done": [str(uid)], "attempts": {}})
+        body = h.points_of("inbox", uid, source=f"{base}.txt")[0]["metadata"]
+        self.assertEqual((body["email_attachments_ingested"], body["email_attachments_failed"]), (["a.pdf"], []))
+        self.assertEqual({r["status"] for r in h.engine.rows.values()}, {"error"})
+        h.reembed()
+        self.assert_only_the_stored_files(h, [f"{base}.txt", f"{base}_1_a.pdf"])
+
+    def test_an_attachment_given_up_does_not_come_back_with_a_new_embedder(self):
+        """Its chunks were kept (the embedding failed): a state left behind would be embedded again."""
+        h = Harness()
+        uid = h.server.folders["INBOX"].append(build_email(attachments=[attachment("pdf", "rotto.pdf")]))
+        h.engine.faults[f"email_monitor_inbox_1_{uid}_1_rotto.pdf"] = ["zero"] * 3
+        for _ in range(3):
+            h.cycle()
+        h.reembed()
+        h.resume()
+        self.assert_only_the_stored_files(h, [f"email_monitor_inbox_1_{uid}.txt"])
+        deleted = [args[1] for args in h.hooks if args[0] == "after_file_manager_file_deleted"]
+        self.assertIn(f"email_monitor_inbox_1_{uid}_1_rotto.pdf", deleted, "the other plugins are told")
+
+    def test_the_emails_of_an_old_uidvalidity_do_not_come_back_with_a_new_embedder(self):
+        h = Harness()
+        h.server.folders["INBOX"].append(build_email(attachments=[attachment("pdf", "a.pdf")]))
+        h.cycle()
+        h.server.folders["INBOX"].renumber()
+        h.cycle()
+        h.reembed()
+        self.assert_only_the_stored_files(h, ["email_monitor_inbox_2_1.txt", "email_monitor_inbox_2_1_1_a.pdf"])
+
+    def test_a_crash_resumed_by_the_core_then_retried_leaves_no_duplicate_nor_orphan(self):
+        """The core resumes the files of the crashed attempt before the plugin retries the email."""
+        h = Harness()
+        uid = h.server.folders["INBOX"].append(build_email(
+            attachments=[attachment("pdf", "a.pdf"), attachment("pdf", "b.pdf")],
+        ))
+        h.engine.faults[f"email_monitor_inbox_1_{uid}_2_b.pdf"] = ["crash_late"]
+        with self.assertRaises(Crash):
+            h.cycle()
+        h.rabbit.locks.clear()
+        h.resume()
+        h.cycle()
+        h.reembed()
+        self.assert_only_the_stored_files(
+            h,
+            [f"email_monitor_inbox_1_{uid}{s}" for s in (".txt", "_1_a.pdf", "_2_b.pdf")],
+        )
+
+    def test_a_crash_before_the_file_is_kept_leaves_nothing_when_the_email_is_given_up(self):
+        """The state of the source is the only trace of that crash: no file, no point; the resume makes it an
+        error (the source was not kept)."""
+        h = Harness()
+        uid = h.server.folders["INBOX"].append(build_email())
+        h.engine.faults[f"email_monitor_inbox_1_{uid}.txt"] = ["crash_early"] * 3
+        for _ in range(3):
+            with self.assertRaises(Crash):
+                h.cycle()
+            h.rabbit.locks.clear()
+            h.resume()
+        h.cycle()
+        self.assertEqual(h.state()["inbox"]["done"], [str(uid)])
+        self.assert_only_the_stored_files(h, [])
+
+    def test_a_crash_before_the_file_is_kept_then_a_new_uidvalidity_leaves_nothing(self):
+        h = Harness()
+        h.server.folders["INBOX"].append(build_email())
+        h.engine.queue = ["crash_early"]
+        with self.assertRaises(Crash):
+            h.cycle()
+        h.rabbit.locks.clear()
+        h.server.folders["INBOX"].renumber()
+        h.cycle()
+        self.assert_only_the_stored_files(h, ["email_monitor_inbox_2_1.txt"])
+
     def test_a_folder_that_does_not_exist_is_skipped(self):
         """A misconfigured folder name (e.g. the Sent folder of another provider): the other folder is stored."""
         h = Harness(sent_folder="Nessuna")
@@ -819,17 +1054,68 @@ class TestMailboxEdges(unittest.TestCase):
     def setUpClass(cls):
         _load()
 
-    def test_the_fake_rabbit_hole_has_the_signature_of_the_core(self):
-        """The fake stands for ``RabbitHole.ingest_file`` of the core: same parameters, same order and defaults,
-        so a change of the core API breaks this test instead of passing unseen on the fake."""
+    def test_the_fake_core_has_the_signatures_of_the_core(self):
+        """The fake stands for the RabbitHole (``ingest_file``, ``delete_source``: same parameters, order and
+        defaults) and for the registry of the states (``get_status``, ``list_statuses``: same parameters, called
+        with all of them), so a change of the core API breaks this test instead of passing unseen on the fake."""
         import inspect
+        from cat.db.cruds import ingestions
         from cat.rabbit_hole import RabbitHole
 
-        def params(fn):
-            return [(p.name, p.kind, p.default) for p in inspect.signature(fn).parameters.values()]
+        def params(fn, defaults=True):
+            return [
+                (p.name, p.kind) + ((p.default,) if defaults else ())
+                for p in inspect.signature(fn).parameters.values()
+            ]
 
-        self.assertEqual(params(Engine.ingest_file), params(RabbitHole.ingest_file))
-        self.assertTrue(inspect.iscoroutinefunction(RabbitHole.ingest_file))
+        for name in ("ingest_file", "delete_source"):
+            self.assertEqual(params(getattr(Engine, name)), params(getattr(RabbitHole, name)), name)
+            self.assertTrue(inspect.iscoroutinefunction(getattr(RabbitHole, name)), name)
+        for name in ("get_status", "list_statuses"):
+            self.assertEqual(params(getattr(Engine, name), False)[1:], params(getattr(ingestions, name), False), name)
+            self.assertTrue(inspect.iscoroutinefunction(getattr(ingestions, name)), name)
+
+    def test_an_ingestion_canceled_is_a_file_not_stored(self):
+        """``ingest_file`` returns None when the source is gone meanwhile (e.g. the agent deleted)."""
+        h = Harness()
+        uid = h.server.folders["INBOX"].append(build_email(attachments=[attachment("pdf", "a.pdf")]))
+        h.engine.faults[f"email_monitor_inbox_1_{uid}_1_a.pdf"] = ["canceled"]
+        h.cycle()
+        self.assertEqual(h.state()["inbox"]["attempts"], {str(uid): 1}, "a failed attempt")
+        self.assertEqual(h.db.points, [])
+
+    def test_the_database_of_the_core_down_ends_the_check_and_the_next_one_cleans(self):
+        """An error of Redis raised by ``ingest_file``, or a deletion failing halfway (left ``deleting``): not the
+        fault of the email; the next check (or the resume of the core) completes the cleanup."""
+        for fault in ("raises", "delete"):
+            with self.subTest(fault):
+                h = Harness()
+                uid = h.server.folders["INBOX"].append(build_email(attachments=[attachment("pdf", "a.pdf"),
+                                                                                attachment("pdf", "b.pdf")]))
+                if fault == "raises":
+                    h.engine.faults[f"email_monitor_inbox_1_{uid}_2_b.pdf"] = ["raises"]
+                else:
+                    h.engine.faults[f"email_monitor_inbox_1_{uid}_2_b.pdf"] = ["zero"] * 4  # the last attempt twice
+                    h.cycle()
+                    h.cycle()
+                    h.engine.delete_fails = True  # the last attempt: the failed attachment is deleted
+                h.cycle()
+                self.assertNotIn(str(uid), h.state()["inbox"]["done"])
+                self.assertEqual(h.rabbit.locks, set())
+                h.cycle()
+                self.assertEqual(h.state()["inbox"]["done"], [str(uid)])
+                ingested = ["a.pdf", "b.pdf"] if fault == "raises" else ["a.pdf"]
+                self.assertEqual(
+                    h.points_of(
+                        "inbox", uid, email_attachments_ingested=ingested
+                    )[0]["metadata"]["email_attachments_failed"],
+                    [] if fault == "raises" else ["b.pdf"],
+                )
+                h.reembed()
+                stored = [".txt", "_1_a.pdf"] + (["_2_b.pdf"] if fault == "raises" else [])
+                TestMailboxCycle.assert_only_the_stored_files(
+                    self, h, [f"email_monitor_inbox_1_{uid}{s}" for s in stored]
+                )
 
     def test_the_imap_calls_do_not_block_the_event_loop(self):
         """Regression: imaplib is blocking: a slow server (up to the 60 s timeout per operation) froze every agent
@@ -860,7 +1146,8 @@ class TestMailboxEdges(unittest.TestCase):
                 beat.cancel()
 
         with patch.object(Client, "uid", slow), patch.object(MODULE, "BillTheLizard", return_value=h.lizard), \
-                patch.object(MODULE, "crud_settings", h.crud), patch.object(MODULE, "_clock", lambda: h.clock), \
+                patch.object(MODULE, "crud_settings", h.crud), patch.object(MODULE, "crud_ingestions", h.engine), \
+                patch.object(MODULE, "_clock", lambda: h.clock), \
                 patch.object(MODULE.imaplib, "IMAP4_SSL", h.server.client):
             asyncio.run(check_with_heartbeat())
         self.assertEqual(len(h.db.points), 1)
@@ -887,8 +1174,10 @@ class TestMailboxEdges(unittest.TestCase):
         report["Subject"] = "Undelivered"
         report.set_content("Consegna non riuscita.")
         report.add_attachment(bounced, disposition="inline")
-        report.replace_header("Content-Type", report.get("Content-Type").replace("multipart/mixed",
-                                                                                 "multipart/report"))
+        report.replace_header(
+            "Content-Type",
+            report.get("Content-Type").replace("multipart/mixed", "multipart/report"),
+        )
         h.server.folders["INBOX"].append(report.as_bytes())
         h.cycle()
         meta = h.db.points[0]["payload"]["metadata"]
@@ -1021,7 +1310,14 @@ class TestMailboxStateMachine(unittest.TestCase):
                 self.h.server.folders[folder].append(build_email(subject=f"s{len(self.expected)}",
                                                                  attachments=atts))
 
-            @rule(faults=st.lists(st.sampled_from(["zero", "crash", "ok", "ok"]), min_size=1, max_size=6))
+            @rule(faults=st.lists(
+                st.sampled_from(
+                    ["zero", "unreadable", "crash", "crash_early", "crash_late", "raises", "other_phase", "ok", "ok",
+                     "ok"]
+                ),
+                min_size=1,
+                max_size=6,
+            ))
             def engine_faults(self, faults):
                 self.h.engine.queue = list(faults)
 
@@ -1052,11 +1348,12 @@ class TestMailboxStateMachine(unittest.TestCase):
                 try:
                     self.h.cycle()
                 except Crash:
-                    for key in self._emails():
-                        state = self._state(key[0])
-                        if str(key[2]) not in state["done"]:
-                            self.dirty[key] = state["attempts"].get(str(key[2]), 0)
+                    self._interrupted()
                     self.h.rabbit.locks.clear()  # the TTL of the lock of the dead process expires
+                    return
+                if self.h.engine.raised:  # a database down ended the check halfway through an email
+                    self.h.engine.raised = False
+                    self._interrupted()
                     return
                 for key, attempts in list(self.dirty.items()):  # processed since: clean again
                     state = self._state(key[0])
@@ -1064,6 +1361,17 @@ class TestMailboxStateMachine(unittest.TestCase):
                             or state["attempts"].get(str(key[2]), 0) != attempts:
                         if state.get("uidvalidity") is not None:
                             del self.dirty[key]
+
+            def _interrupted(self):
+                """The emails not done may hold what the interrupted attempt stored, until a cycle processes them."""
+                for key in self._emails():
+                    state = self._state(key[0])
+                    if str(key[2]) not in state["done"]:
+                        self.dirty[key] = state["attempts"].get(str(key[2]), 0)
+
+            @rule()
+            def delete_fault(self):  # the next deletion fails halfway (the vector DB down)
+                self.h.engine.delete_fails = True
 
             @rule()
             def another_cycle(self):  # cycles are what moves the state: twice as likely
@@ -1076,6 +1384,13 @@ class TestMailboxStateMachine(unittest.TestCase):
                 engine.faults, engine.queue, engine.broken, engine.break_next = {}, [], {}, None
                 self.h.reembed()
                 engine.faults, engine.queue, engine.broken, engine.break_next = saved
+
+            @rule()
+            def resume(self):
+                """The automatic resume of the core, between two checks. In production it runs during a check too
+                (every minute, on any pod): the lock of each source serializes it with the plugin, so a resume in the
+                middle of a check is a resume before or after one of its ingestions or deletions."""
+                self.h.resume()
 
             # -- model helpers --
             def _emails(self):
@@ -1098,6 +1413,10 @@ class TestMailboxStateMachine(unittest.TestCase):
                 case.assertEqual(len(sources), len(set(sources)), "a source stored twice")
 
             def _dirty_source(self, source):
+                """A file of an email left half by an interrupted attempt, or being deleted (an interrupted deletion:
+                the core or the next check completes it)."""
+                if (self.h.engine.rows.get(source) or {}).get("status") == "deleting":
+                    return True
                 match = re.match(r"email_monitor_(inbox|sent)_(\d+)_(\d+)[._]", source)
                 return match is not None and (match[1], int(match[2]), int(match[3])) in self.dirty
 
@@ -1106,7 +1425,24 @@ class TestMailboxStateMachine(unittest.TestCase):
                 stored = {f"{AGENT}/{s}" for s in self.h.db.sources()}
                 extra = [f for f in self.h.files.files if f not in stored]
                 case.assertEqual([f for f in extra if not self._dirty_source(os.path.basename(f))], [])
-                case.assertEqual([f for f in stored if f not in self.h.files.files], [])
+                case.assertEqual(
+                    [f for f in stored if f not in self.h.files.files and not self._dirty_source(os.path.basename(f))],
+                    [],
+                )
+
+            @invariant()
+            def the_core_keeps_only_the_files_of_the_points(self):
+                """No ingestion state or kept chunks of a file without points (out of the emails left half by a
+                crash): the resume or a change of embedder would bring it back. A file with points has its embedding
+                completed (its state may be in error for a phase of another plugin)."""
+                stored = set(self.h.db.sources())
+                for name in set(self.h.engine.rows) | set(self.h.engine.chunks) | stored:
+                    if not self._dirty_source(name):
+                        case.assertIn(name, stored, "a state or chunks without points")
+                        row = self.h.engine.rows.get(name) or {"completed_phases": {}}
+                        case.assertEqual(
+                            Engine._state(row, "embedding"), "complete", f"{name}: points without a completed embedding"
+                        )
 
             @invariant()
             def no_point_of_an_old_uidvalidity(self):
@@ -1126,9 +1462,12 @@ class TestMailboxStateMachine(unittest.TestCase):
                     state = self._state(ftype)
                     if state.get("uidvalidity") != str(validity):
                         continue
-                    stored = [p for p in self.h.db.points if p["payload"]["metadata"]["email_folder"] == ftype
-                              and p["payload"]["metadata"]["email_uid"] == str(uid)
-                              and p["payload"]["metadata"]["email_uidvalidity"] == str(validity)]
+                    stored = [
+                        p for p in self.h.db.points
+                        if p["payload"]["metadata"]["email_folder"] == ftype
+                           and p["payload"]["metadata"]["email_uid"] == str(uid)
+                           and p["payload"]["metadata"]["email_uidvalidity"] == str(validity)
+                    ]
                     if str(uid) not in state["done"]:
                         case.assertEqual(stored, [], (ftype, uid))
                         case.assertLessEqual(state["attempts"].get(str(uid), 0), MODULE.MAX_ATTEMPTS)
@@ -1139,10 +1478,16 @@ class TestMailboxStateMachine(unittest.TestCase):
                         case.assertEqual(stored, [])
                         continue
                     meta = bodies[0]["payload"]["metadata"]
-                    names = (meta["email_attachments_ingested"] + meta["email_attachments_failed"]
-                             + [s["name"] for s in meta["email_attachments_skipped"]])
-                    attached = [p["payload"]["metadata"]["email_attachment_filename"] for p in stored
-                                if "email_attachment_filename" in p["payload"]["metadata"]]
+                    names = (
+                            meta["email_attachments_ingested"]
+                            + meta["email_attachments_failed"]
+                            + [s["name"] for s in meta["email_attachments_skipped"]]
+                    )
+                    attached = [
+                        p["payload"]["metadata"]["email_attachment_filename"]
+                        for p in stored
+                        if "email_attachment_filename" in p["payload"]["metadata"]
+                    ]
                     case.assertEqual(sorted(attached), sorted(meta["email_attachments_ingested"]))
                     case.assertEqual(len(names), self._attachment_count(ftype, uid))
 
@@ -1154,8 +1499,12 @@ class TestMailboxStateMachine(unittest.TestCase):
                 msg = email_lib.message_from_bytes(folder.messages[uid], policy=email.policy.default)
                 return sum(1 for part in msg.iter_attachments() if part.get("Content-ID") is None)
 
-        Machine.TestCase.settings = settings(max_examples=200, stateful_step_count=30, deadline=None,
-                                             suppress_health_check=[HealthCheck.too_slow])
+        Machine.TestCase.settings = settings(
+            max_examples=200,
+            stateful_step_count=30,
+            deadline=None,
+            suppress_health_check=[HealthCheck.too_slow],
+        )
         Machine.TestCase("runTest").runTest()
 
 

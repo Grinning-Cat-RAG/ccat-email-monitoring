@@ -10,18 +10,23 @@ Monitors an email mailbox via IMAP and automatically stores every **incoming** (
    operation gives up after 60 seconds).
 2. It periodically scans (every N minutes, configurable) both the Inbox and Sent folders, oldest email first.
 3. Every new email is stored as **files** through the RabbitHole of the core, as an upload is: its body as a
-   text file, and its attachments when **Ingest Attachments** is on. The files are kept in the file storage of the
-   agent, so a **change of embedder re-embeds them** like any uploaded file.
+   text file, and its attachments when **Ingest Attachments** is on. Like any uploaded file, each one gets an
+   ingestion state in the core (see `GET /ingestion/status`): a **change of embedder re-embeds them**, and the core
+   resumes by itself an ingestion interrupted by a restart. A file is stored when its embedding is completed (it has
+   its points): a phase another plugin adds that fails leaves its error in the ingestion state, not the email to do
+   again.
 4. The state of each folder (its UIDVALIDITY, the UIDs done, the failed attempts) is saved in the database after
    every email: an interrupted check (e.g. a restart) resumes where it stopped, without duplicates.
 
 A check holds a lock for its whole duration (one check at a time per agent, also across nodes) and starts no new
 email after **Check Time Budget** minutes (the email it is storing is completed), so a deactivation or a settings
-update, which wait for the running check, wait at most that long.
+update, which wait for the running check, wait at most that long. After a crash in the middle of a file, the first
+check after the restart may wait longer: it cleans that file, which the core keeps locked for the dead process until
+its lock expires (`CAT_INGESTION_LOCK_TIMEOUT_SECONDS` after its last renewal, 300 seconds by default).
 
 An email whose storing fails (an attachment the parser cannot read, an email the server does not return) is deleted
-from memory, files included, and tried again at the next check; after 3 failed attempts it is given up (logged as an
-error): its failed attachments are listed in the metadata of its body, or, when it cannot be read at all, it is
+from memory, files and ingestion states included, and tried again at the next check; after 3 failed attempts it is
+given up (logged as an error): its failed attachments are listed in the metadata of its body, or, when it cannot be read at all, it is
 skipped. An attempt is counted before it starts, so an email that crashes the process (e.g. a malformed attachment
 that kills the parser) is given up after 3 restarts too; a restart for any other reason while an email is being
 stored costs that email one attempt.
@@ -32,6 +37,12 @@ an attempt, and the next check tries again, so no email is lost to an outage.
 
 When the server changes the UIDVALIDITY of a folder (its UIDs are not valid anymore), the emails of that folder are
 deleted from memory and the folder is read again.
+
+The plugin deletes a file of an email as the file manager of the core does (`DELETE /files/{name}`): the file, its
+points, what the core kept for it and its ingestion state go together, and the plugins are told
+(`before_file_manager_file_delete`, `after_file_manager_file_deleted`). Nothing deleted comes back with a change of
+embedder or a resume of the core. A file the core is ingesting (e.g. resuming it after a restart) is deleted when that
+ingestion ends.
 
 The Cat will then be able to recall emails during conversations thanks to the RAG (Retrieval-Augmented Generation) mechanism.
 
@@ -176,23 +187,29 @@ The body adds `email_attachments_ingested` (file names), `email_attachments_skip
 
 ## Removing Emails from Memory
 
-To delete all stored emails, delete their points by the configured **Memory Source Tag**, and their files (the
-name of each file is the `source` of its points):
+To delete all stored emails, delete their files by the configured **Memory Source Tag**, through the core, so that
+their ingestion states go too (deleting only the points would let a change of embedder bring them back). Each file
+can be deleted with `DELETE /files/{name}`, or all of them from code:
 
 ```python
 import os
+from cat.db.cruds import ingestions as crud_ingestions
 
 metadata = {"email_source_tag": "email_monitor"}
 points, _ = await cat.vector_memory_handler.get_all_tenant_points("declarative", metadata=metadata, with_vectors=False)
-await cat.vector_memory_handler.delete_tenant_points("declarative", metadata=metadata)
-for source in {p.payload["metadata"]["source"] for p in points}:
-    cat.file_manager.remove_file(os.path.join(cat.agent_key, source))
+names = {p.payload["metadata"]["source"] for p in points}
+names |= {
+    row["source"]
+    for row in await crud_ingestions.list_statuses(cat.agent_key, None)
+    if (row.get("metadata") or {}).get("email_source_tag") == metadata["email_source_tag"]
+}
+for name in names:
+    async def remove_file(name=name):
+        cat.file_manager.remove_file(os.path.join(cat.agent_key, name))
+    await cat.rabbit_hole.delete_source(cat, name, before=remove_file)
 ```
 
 The UIDs of the deleted emails stay recorded as processed: they are not ingested again.
-
-Avoid changing the embedder while a check is running: the re-embed of the core takes no lock, and an email stored
-between its listing of the stored files and its deletion of the points would stay without points.
 
 ---
 

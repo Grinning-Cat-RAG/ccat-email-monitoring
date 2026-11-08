@@ -1,7 +1,8 @@
 """The body stored in memory: the text/plain and text/html parts that are not attachments, the HTML converted to plain
 text, one choice per multipart/alternative; attachments (and whatever they contain) never end up in the body.
 
-Run from the core root: ``python -m pytest cat/plugins/ccat-email-monitoring/tests``.
+Run from the core root, with the secrets the core requires (any value for the tests):
+``CAT_CRYPTO_KEY=test CAT_CRYPTO_SALT=test python -m pytest cat/plugins/ccat-email-monitoring/tests``.
 
 The Cat imports every ``.py`` file of the plugin, tests included: at import time this module needs only the stdlib,
 the Cat, the plugin and hypothesis are loaded in ``setUpClass`` and in the tests.

@@ -30,6 +30,9 @@ from langchain_core.documents import Document
 from cat.core_plugins.white_rabbit.white_rabbit import JobStatus
 from cat.log import log
 from cat import hook, CheshireCat, BillTheLizard
+from cat.db.cruds import ingestions as crud_ingestions
+from cat.rabbit_hole.engine import STATE_COMPLETE
+from cat.rabbit_hole.phases import PHASE_EMBEDDING
 from cat.db.cruds.settings import crud as crud_settings
 from cat.utils import guess_file_type
 from .settings import EmailMonitorSettings
@@ -415,12 +418,6 @@ def _folder_prefix(settings: EmailMonitorSettings, folder_type: str, uidvalidity
     return f"{_tag(settings)}_{folder_type}_{_slug(uidvalidity, 20) or '0'}_"
 
 
-def _stored_files(cat: CheshireCat, prefix: str) -> List[str]:
-    """The names of the stored files of the agent starting with ``prefix`` (only when their names cannot be
-    computed: it lists every file of the agent)."""
-    return [f.name for f in cat.file_manager.list_files(cat.agent_key) if f.name.startswith(prefix)]
-
-
 def _email_headers(msg: Message) -> Dict[str, Any]:
     """The decoded headers of an email; a missing or unreadable date is now."""
     date_str = msg.get("Date", "")
@@ -616,37 +613,68 @@ def _email_filter(folder_type: str, uidvalidity: str, uid: str | None = None) ->
     return flt | ({"email_uid": uid} if uid is not None else {})
 
 
-async def _purge(cat: CheshireCat, metadata: Dict, sources: List[str] = ()) -> None:
-    """Delete the points matching ``metadata`` and their files, and the files named ``sources`` (the engine stores a
-    file before parsing it: a file whose parsing failed has no points)."""
-    handler = cat.vector_memory_handler
-    points, _ = await handler.get_all_tenant_points(DECLARATIVE, metadata=metadata, with_vectors=False)
-    names = {p.payload.get("metadata", {}).get("source") for p in points} | set(sources)
-    await handler.delete_tenant_points(DECLARATIVE, metadata=metadata)
-    for name in sorted(n for n in names if n):
+async def _delete_file(cat: CheshireCat, engine: Any, name: str) -> None:
+    """Delete a file of an email as the file manager of the core does (``DELETE /files``): the uploaded file, then what
+    the ingestion of the core produced for it (its points, its kept chunks, its ingestion state), the plugins told.
+    Without its state and chunks, neither the automatic resume nor a change of embedder can bring it back. It waits
+    for a worker ingesting it (e.g. the resume of a crashed attempt) to end."""
+    async def remove_file() -> None:
         cat.file_manager.remove_file(os.path.join(cat.agent_key, name))
+        await cat.plugin_manager.execute_hook("before_file_manager_file_delete", name, "agent", caller=cat)
+
+    await engine.delete_source(cat, name, before=remove_file)
+    await cat.plugin_manager.execute_hook("after_file_manager_file_deleted", name, "agent", caller=cat)
+
+
+async def _stored_sources(cat: CheshireCat, prefix: str) -> List[str]:
+    """The names of the files of the agent starting with ``prefix``, stored or with an ingestion state (a crash may
+    leave a state without its file); only when their names cannot be computed: it lists every file of the agent."""
+    names = {f.name for f in cat.file_manager.list_files(cat.agent_key)}
+    names |= {row["source"] for row in await crud_ingestions.list_statuses(cat.agent_key, None)}
+    return sorted(n for n in names if n.startswith(prefix))
+
+
+async def _purge(
+    cat: CheshireCat, engine: Any, metadata: Dict, sources: List[str] = (), existing: List[str] = (),
+) -> None:
+    """Delete the files with points matching ``metadata``, the files ``existing`` (found by ``_stored_sources``), and
+    the files named ``sources`` that exist: the ones with an ingestion state (a crash or a failed parsing leaves a file
+    without points, a crash before the file is kept a state only). The core creates the state of a file before keeping
+    anything of it and removes it last: a name without state nor points has nothing to delete, so a new email costs
+    no deletion."""
+    points, _ = await cat.vector_memory_handler.get_all_tenant_points(DECLARATIVE, metadata=metadata,
+                                                                      with_vectors=False)
+    names = {p.payload.get("metadata", {}).get("source") for p in points} | set(existing)
+    for name in set(sources) - names:
+        if await crud_ingestions.get_status(cat.agent_key, None, name) is not None:
+            names.add(name)
+    for name in sorted(n for n in names if n):
+        await _delete_file(cat, engine, name)
 
 
 async def _ingest(cat: CheshireCat, engine: Any, file: _EmailFile) -> bool:
-    """Ingest a file through the RabbitHole of the core, as an upload is. It logs and swallows its errors (a
-    file it cannot parse, an embedder down): the file is stored when it has points."""
-    await engine.ingest_file(cat=cat, file=BytesIO(file.data), filename=file.source, metadata=file.metadata,
-                             store_file=True, content_type=file.content_type)
-    points, _ = await cat.vector_memory_handler.get_all_tenant_points(
-        DECLARATIVE, limit=1, metadata={"source": file.source}, with_vectors=False,
-    )
-    return bool(points)
+    """Ingest a file through the RabbitHole of the core, as an upload is. It logs and swallows the errors of the
+    ingestion (a file it cannot parse, an embedder down; None when it was canceled): the file is stored when the
+    embedding phase of its ingestion state, returned, is completed, i.e. it has its points, as the core decides when it
+    notifies them. A phase another plugin adds may still have failed: the error stays in the state, the core shows it
+    and runs it again with a change of embedder, and it does not block the mailbox. An error of its own database
+    (Redis) is raised: it ends the check."""
+    row = await engine.ingest_file(cat=cat, file=BytesIO(file.data), filename=file.source, metadata=file.metadata,
+                                   store_file=True, content_type=file.content_type)
+    embedding = ((row or {}).get("completed_phases") or {}).get(PHASE_EMBEDDING) or {}
+    return embedding.get("state") == STATE_COMPLETE
 
 
 class _ServiceDown(Exception):
-    """The body of an email, plain text that always parses, got no points: the embedder or the vector DB is down."""
+    """The body of an email, plain text that always parses, was not stored: the embedder or the vector DB is down."""
 
 
 async def _store_email(cat: CheshireCat, engine: Any, plan: _EmailPlan, last_attempt: bool) -> bool:
     """Store the files of an email: its attachments, then its body, listing what was ingested, skipped, failed.
     Returns whether the email is done (on the last attempt the failed attachments are given up, listed in the body);
-    when it is not, the caller deletes all of it. A body without points raises ``_ServiceDown``, nothing of the
-    email left: the engine swallows its errors, the body is what tells a service down from a file nobody can read."""
+    when it is not, the caller deletes all of it. A body not stored raises ``_ServiceDown``, nothing of the email
+    left: the engine swallows the errors of the ingestion, the body is what tells a service down from a file nobody
+    can read."""
     ingested, failed = [], []
     for file in plan.attachments:
         (ingested if await _ingest(cat, engine, file) else failed).append(file)
@@ -660,13 +688,18 @@ async def _store_email(cat: CheshireCat, engine: Any, plan: _EmailPlan, last_att
         },
     )
     if not await _ingest(cat, engine, body):
-        await _purge(cat, _email_filter(plan.body.metadata["email_folder"], plan.body.metadata["email_uidvalidity"],
-                                        plan.body.metadata["email_uid"]), plan.sources)
-        raise _ServiceDown(f"no points for '{body.source}': the embedder or the vector DB is down")
+        meta = plan.body.metadata
+        await _purge(
+            cat,
+            engine,
+            _email_filter(meta["email_folder"], meta["email_uidvalidity"], meta["email_uid"]),
+            plan.sources,
+        )
+        raise _ServiceDown(f"'{body.source}' not stored: the embedder or the vector DB is down")
     if failed and not last_attempt:
         return False
-    for file in failed:  # stored by the engine, without points
-        cat.file_manager.remove_file(os.path.join(cat.agent_key, file.source))
+    for file in failed:  # kept by the engine (its file, its state, maybe its chunks), without points
+        await _delete_file(cat, engine, file.source)
     return True
 
 
@@ -695,7 +728,9 @@ async def _process_email(
     base = f"{_folder_prefix(settings, folder_type, uidvalidity)}{_slug(uid, 20)}"
     if previous >= MAX_ATTEMPTS:  # the last attempt crashed
         log.error(f"[EmailMonitor] The email {folder_type}/{uid} failed {previous} times: it is given up")
-        await _purge(cat, email_filter, [n for n in _stored_files(cat, base) if n[len(base)] in "._"])
+        await _purge(
+            cat, engine, email_filter, existing=[n for n in await _stored_sources(cat, base) if n[len(base)] in "._"],
+        )
         state["done"].append(uid)
         state["attempts"].pop(uid, None)
         return
@@ -715,12 +750,18 @@ async def _process_email(
             log.error(f"[EmailMonitor] Error reading the email {folder_type}/{uid}: {e}")
         done = False
         if plan is not None:
-            await _purge(cat, email_filter, plan.sources)
+            await _purge(cat, engine, email_filter, plan.sources)
             done = await _store_email(cat, engine, plan, attempt >= MAX_ATTEMPTS)
         if not done:
-            sources = plan.sources if plan is not None else [  # unread: the names of its files by their start
-                n for n in _stored_files(cat, base) if n[len(base)] in "._"]
-            await _purge(cat, email_filter, sources)
+            if plan is not None:
+                await _purge(cat, engine, email_filter, plan.sources)
+            else:  # unread: the names of its files by their start
+                await _purge(
+                    cat,
+                    engine,
+                    email_filter,
+                    existing=[n for n in await _stored_sources(cat, base) if n[len(base)] in "._"],
+                )
     except Exception:
         if previous:
             state["attempts"][uid] = previous
@@ -749,9 +790,14 @@ async def _check_folder(
     if state["uidvalidity"] != uidvalidity:
         if state["uidvalidity"] is not None:
             log.warning(f"[EmailMonitor] UIDVALIDITY of '{folder}' changed: the folder is read again")
-            # the files by name too: a crashed attempt may have left one without points
-            await _purge(cat, _email_filter(folder_type, state["uidvalidity"]),
-                         _stored_files(cat, _folder_prefix(settings, folder_type, state["uidvalidity"])))
+            # the files by name too: a crashed attempt may have left one without points, or a state only
+            prefix = _folder_prefix(settings, folder_type, state["uidvalidity"])
+            await _purge(
+                cat,
+                engine,
+                _email_filter(folder_type, state["uidvalidity"]),
+                existing=await _stored_sources(cat, prefix),
+            )
         states[folder_type] = state = {"uidvalidity": uidvalidity, "done": [], "attempts": {}}
         await _save_state(cat, states)
 
